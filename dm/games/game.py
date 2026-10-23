@@ -99,6 +99,8 @@ def header(g):
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
     asp = g.get('aspect', '16:9')   # 16:9 = the game's own picture; any = its output size stub renders any aspect ratio, so the host gives it the screen's (loader.c, iOS front end)
     if asp not in ('16:9', 'any'): sys.exit(f'{g.id}: aspect must be 16:9 or any: {asp}')
+    fm = g.get('fps_max', '60')   # the highest frame rate a game that steps by the time that passed keeps its speed at, with no frame step of the rewriter (Hades, hle_vk.m vk_fps): 60 = none above 60
+    if not fm.isdigit() or not 60 <= int(fm) <= 240: sys.exit(f'{g.id}: fps_max must be 60 to 240: {fm}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
@@ -159,6 +161,7 @@ def header(g):
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
          f'#define DM_GAME_ASPECT_ANY {int(asp == "any")}',
+         f'#define DM_GAME_FPS_MAX {int(fm)}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
          f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
          f'#define DM_GAME_OPMODE {int(om == "console")}',

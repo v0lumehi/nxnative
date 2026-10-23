@@ -1535,7 +1535,8 @@ static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides 
 // step (BotW's VFR override in cutscenes) or a prerendered movie halves the cap, the whole-vsync step holds as below
 __attribute__((weak)) int dm_fps_var_cap;   // loader.c; graphics unit tests have no loader
 static int vstep_on(void) { return dm_fps_var_cap && fps_step_cap() == 60 && !__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED); }
-int nvn_var_fps(void) { return dm_fps_state && vstep_on() ? dm_fps_var_cap : 0; }   // nvn_mtl.m: the display link runs at the cap while the variable step holds
+__attribute__((weak)) int dm_vk_var_fps(void) { return 0; }   // hle_vk.m: a Vulkan game presenting above 60 (profile fps_max); graphics unit tests have no Vulkan layer
+int nvn_var_fps(void) { return dm_fps_state && vstep_on() ? dm_fps_var_cap : dm_vk_var_fps(); }   // nvn_mtl.m: the display link runs at the cap while the variable step holds
 static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)

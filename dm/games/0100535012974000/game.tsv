@@ -25,6 +25,9 @@ shader_versions	v589824
 # bar art (Launch/SideBars_01, sgg's CalculateViewportForAspectRatio at main+0x47c1b0) on both sides, so the picture fills the screen with no black bars, crop or stretch (checked on the
 # Mac at 2868x1320 and 1568x720). On an iPhone the output takes the screen's aspect (loader.c output_aspect; the launcher's Picture switch, Wide by default)
 aspect	any
+# it steps by the time that passed, so it keeps its speed above 60 fps (DM_FPS_TARGET up to 240 presents at that rate, hle_vk.m vk_fps; the iOS launcher offers 120): at 120 the intro
+# reached the same scene at the same real time as at 60 (screenshots at frame N at 60 and 2N at 120)
+fps_max	240
 # main imports Vulkan, not NVN: the host's Vulkan layer (dm/gfx/vk/hle_vk.m); dm/gfx/tools/vk_shaders.py translates the SPIR-V shaders into <shader dir>/vk/
 
 # ---- Files ----
