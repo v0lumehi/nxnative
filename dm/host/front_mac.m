@@ -12,6 +12,7 @@
 #include "front.h"
 #include "hle.h"
 #include <signal.h>
+#include <math.h>
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
@@ -20,6 +21,42 @@ static int g_w, g_a, g_s, g_d;
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
 int front_screen_max_fps(void) { return g_screen_fps; }
+// The screen's refresh rate matched to the game's frame rate (front_screen_match; DM_SCREEN_MATCH=0 turns it off). 60 fps on a 144 Hz screen cannot be paced evenly: the display link
+// counted a tick on the refresh nearest each 1/60 s slot (nvn_mtl.m link_range), so frames stayed up 2 and 3 refreshes in turn (13.9 / 20.8 ms) and Apple's HUD showed the frame
+// interval jumping between them. A screen whose rate is not a multiple of the game's switches to a mode of the same size and the highest rate that is (144 → 120 Hz for 60 and 30
+// fps), for this app only: macOS switches it back when the host quits. A screen with no such mode keeps the virtual ticks
+static NSWindow *g_win; static int g_match_want;   // the window, and the frame rate to match (0 = not asked yet)
+static double mode_hz(CGDisplayModeRef m) { double hz = CGDisplayModeGetRefreshRate(m); return hz > 0 ? hz : 0; }
+static void screen_match_apply(void) {   // main thread
+    int want = g_match_want; NSScreen *scr = g_win.screen ?: NSScreen.mainScreen;
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_SCREEN_MATCH"); off = e && !strcmp(e, "0"); if (off) LOG("front end: the screen keeps its refresh rate (DM_SCREEN_MATCH=0)"); }
+    if (off || want <= 0 || !scr) return;
+    CGDirectDisplayID id = [scr.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(id); if (!cur) return;
+    double hz = mode_hz(cur);
+    if (hz <= 0 || fabs(hz / want - round(hz / want)) < 0.01) { CGDisplayModeRelease(cur); return; }   // already a multiple (a ProMotion screen reports 0 and paces any rate)
+    size_t w = CGDisplayModeGetWidth(cur), h = CGDisplayModeGetHeight(cur), pw = CGDisplayModeGetPixelWidth(cur), ph = CGDisplayModeGetPixelHeight(cur);
+    CGDisplayModeRelease(cur);
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, (__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES}); if (!modes) return;
+    CGDisplayModeRef pick = NULL; double pick_hz = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+        CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i); double r = mode_hz(m);
+        if (CGDisplayModeGetWidth(m) != w || CGDisplayModeGetHeight(m) != h || CGDisplayModeGetPixelWidth(m) != pw || CGDisplayModeGetPixelHeight(m) != ph || !CGDisplayModeIsUsableForDesktopGUI(m)) continue;
+        if (r >= want && fabs(r / want - round(r / want)) < 0.01 && r > pick_hz) { pick = m; pick_hz = r; }
+    }
+    CGDisplayConfigRef cfg;
+    if (pick && CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
+        CGConfigureDisplayWithDisplayMode(cfg, id, pick, NULL);
+        CGError r = CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
+        if (r == kCGErrorSuccess) g_screen_fps = (int)round(pick_hz);
+        LOG("front end: screen at %.0f Hz %s %.0f Hz for %d fps while the game runs (DM_SCREEN_MATCH=0 keeps it)", hz, r == kCGErrorSuccess ? "switched to" : "could not switch to", pick_hz, want);
+    } else LOG("front end: screen at %.0f Hz has no mode of this size at a multiple of %d Hz: frames are paced on the nearest refreshes", hz, want);
+    CFRelease(modes);
+}
+void front_screen_match(int fps) {
+    if (fps == g_match_want) return;
+    g_match_want = fps; dispatch_async(dispatch_get_main_queue(), ^{ screen_match_apply(); });
+}
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
     dm_input_set(g_btn, lx, ly, 0, 0);
@@ -127,6 +164,7 @@ void front_run(void (*guest)(void)) {
         [win center];
         [win makeKeyAndOrderFront:nil];
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
+        g_win = win;
         [NSApp activateIgnoringOtherApps:YES];
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
@@ -152,7 +190,7 @@ void front_run(void (*guest)(void)) {
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (win.screen) { g_screen_fps = (int)win.screen.maximumFramesPerSecond; g_layer.contentsScale = win.backingScaleFactor; } }];
+        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (win.screen) { g_screen_fps = (int)win.screen.maximumFramesPerSecond; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); } }];   // the new screen is matched too
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on.
         [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; }];
