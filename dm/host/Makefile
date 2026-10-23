@@ -50,8 +50,15 @@ endif
 endif
 .PHONY: FORCE
 FORCE:
-dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
-	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+# The host's own Info.plist, linked into its __TEXT,__info_plist section: a bundle ID per game (org.nxnative.dmhost.<id>). Without one, Metal keeps compiled pipelines in the
+# shared cache of command-line tools, which holds only a few files that rotate, so a run of another game (or any other tool) pushed a game's pipelines out and its next start built
+# them again: Breath of the Wild prewarmed 6,097 pipelines in 18 s at every start and still stuttered on pipelines it had built before. A build hit in Metal's cache takes
+# 0.03–0.06 ms, a cold one 14 ms (median) to 67 ms (p95) on an M2 Max. A packed Mac app has a bundle ID of its own already
+HOST_PLIST = gen/$(GAME)/Info.plist
+$(HOST_PLIST): $(GAME_STAMP)
+	@mkdir -p $(dir $@); printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.nxnative.dmhost.%s</string><key>CFBundleName</key><string>dmhost</string></dict></plist>\n' "$$(echo $(GAME) | tr A-Z a-z)" > $@
+dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB) $(HOST_PLIST)
+	clang $(CFLAGS) -Wl,-sectcreate,__TEXT,__info_plist,$(HOST_PLIST) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
 clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx build; dmhost_* and *.dSYM beside them, as in .gitignore)
 	rm -rf gen dmhost dmhost_* *.dSYM
 .PHONY: clean

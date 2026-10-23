@@ -192,6 +192,7 @@ Metal compiles each combination of shaders and pipeline settings for the GPU the
 
 - `pso_user.tsv` sits next to the save directory: `Documents/pso_user.tsv` on iOS, the parent of `DM_SAVE` on the Mac (`DM_PSO_USER=path` overrides it). It is appended while playing, one line per item built on the spot: a shader (`S`), a render pipeline (`R`, the hex of `pso_skey` in `dm/gfx/nvn/nvn_pso_skey.h`) or a compute pipeline (`C`).
 - `dm/games/<id>/pso_manifest.tsv` is the seed list bundled with the app, prewarmed before `pso_user.tsv`.
+- The prewarm builds pipelines, and Metal keeps what it compiled in its own disk cache, keyed by the app's bundle ID. A hit there costs 0.03–0.06 ms, a cold build 14 ms (median) to 67 ms (p95) on an M2 Max. The Mac host links a bundle ID per game (`org.nxnative.dmhost.<id>`, `dm/host/Makefile`). Without it, Metal used the shared cache of command-line tools, which keeps only a few files that rotate, so a run of another game pushed a game's pipelines out and its next start compiled them all again. Packed Mac apps and iOS apps have their own bundle IDs.
 
 The lines name shaders by content key and hold no compiled code and nothing personal, so a list recorded on one device works on any other. To seed the bundled list:
 1. Record on the Mac with prewarm off, so everything is built on demand: `DM_PSO_MANIFEST=off DM_PSO_RECORD=<file>`, playing the scenes players reach first. Engage's list covers boot, the opening movie, the title, a save load and the prologue battle.
