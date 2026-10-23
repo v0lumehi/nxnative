@@ -1160,12 +1160,32 @@ static int ub_skip(const char *key) {   // Whether this phase should drop draws 
 void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
+// DM_NVN_SYNCPROF=1 (diagnostic): where a frame's time goes between the GPU and the game's waits (hle_nvn.c nvnSyncWait). Per window: the GPU's busy time (the union of the
+// game's command buffers on the GPU timeline, segments included), its idle time between them, and the CPU-visible effects the commits carried
+static _Atomic uint64_t g_sp_busy_ns, g_sp_cbs, g_sp_eff[4], g_sp_gap_ns, g_sp_gaps;
+static double g_sp_last_end; static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;   // GPU end of the latest command buffer seen (gpu_tag_done)
+static void sp_gpu(double g0, double g1) {   // every command buffer of the game's queue, segments included: busy = their union on the GPU timeline, gaps = idle time between them
+    if (!(g0 > 0 && g1 > g0)) return;
+    pthread_mutex_lock(&g_sp_mu);
+    if (g_sp_last_end > 0 && g0 > g_sp_last_end) { atomic_fetch_add(&g_sp_gap_ns, (uint64_t)((g0 - g_sp_last_end) * 1e9)); atomic_fetch_add(&g_sp_gaps, 1); }
+    double s0 = g0 > g_sp_last_end ? g0 : g_sp_last_end;
+    if (g1 > s0) atomic_fetch_add(&g_sp_busy_ns, (uint64_t)((g1 - s0) * 1e9));
+    if (g1 > g_sp_last_end) g_sp_last_end = g1;
+    pthread_mutex_unlock(&g_sp_mu);
+    atomic_fetch_add(&g_sp_cbs, 1);
+}
+int mtl_syncprof(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SYNCPROF"); v = e && atoi(e) > 0; } return v; }
+void mtl_syncprof_take(uint64_t *busy_ns, uint64_t *cbs, uint64_t eff[4], uint64_t *gap_ns, uint64_t *gaps) {
+    *busy_ns = atomic_exchange(&g_sp_busy_ns, 0); *cbs = atomic_exchange(&g_sp_cbs, 0); *gap_ns = atomic_exchange(&g_sp_gap_ns, 0); *gaps = atomic_exchange(&g_sp_gaps, 0);
+    for (int i = 0; i < 4; i++) eff[i] = atomic_exchange(&g_sp_eff[i], 0);
+}
 static void gpu_tag_begin(uint64_t f) {
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f) { atomic_store(&g_gpu[k].frame, f); atomic_store(&g_gpu[k].ns, 0); atomic_store(&g_gpu[k].pending, 0); atomic_store(&g_gpu[k].t0, UINT64_MAX); atomic_store(&g_gpu[k].t1, 0); }
     atomic_fetch_add(&g_gpu[k].pending, 1);
 }
 static void gpu_tag_done(uint64_t f, double g0, double g1) {
+    if (mtl_syncprof()) sp_gpu(g0, g1);
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f) return;
     double d = g1 - g0;
@@ -1201,6 +1221,7 @@ uint64_t mtl_sub_commit(void) {
     up_flush();
     g_cut_copy = 0;
     uint64_t fence = ++g_fence;
+    if (mtl_syncprof()) for (int i = 0; i < g_npost; i++) atomic_fetch_add(&g_sp_eff[g_post[i].kind & 3], 1);
     gw_commit(fence);
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // CPU-visible effects after completion: copy the op table into the callback

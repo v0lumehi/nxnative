@@ -624,11 +624,46 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; stat
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
+// DM_NVN_SYNCPROF=1: the waits that block, per thread (up to 8 threads by name): count, time blocked, and how many commits came after the fence waited for (0 = the newest)
+int mtl_syncprof(void);
+typedef struct { char name[32]; uint64_t n, ns, lag[3], timeouts; } sp_thr;
+static sp_thr g_sp_thr[8]; static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;
+static void sp_note(uint64_t ns, uint64_t lag, int timeout) {
+    char nm[32] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    pthread_mutex_lock(&g_sp_mu);
+    int i = 0; while (i < 8 && g_sp_thr[i].name[0] && strcmp(g_sp_thr[i].name, nm)) i++;
+    if (i < 8) { if (!g_sp_thr[i].name[0]) snprintf(g_sp_thr[i].name, sizeof g_sp_thr[i].name, "%s", nm[0] ? nm : "?"); sp_thr *t = &g_sp_thr[i]; t->n++; t->ns += ns; t->lag[lag > 2 ? 2 : lag]++; t->timeouts += timeout; }
+    pthread_mutex_unlock(&g_sp_mu);
+}
+static _Atomic uint64_t g_sp_calls, g_sp_signaled, g_sp_unfenced, g_sp_finish, g_sp_finish_ns;
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
-    if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (mtl_syncprof()) atomic_fetch_add(&g_sp_calls, 1);
+    if (!o->fenced) { if (mtl_syncprof()) atomic_fetch_add(&g_sp_unfenced, 1); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
+    if (mtl_wait(o->fence, 0)) { if (mtl_syncprof()) atomic_fetch_add(&g_sp_signaled, 1); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    if (mtl_syncprof()) {
+        uint64_t t0 = now_ns(), lag = mtl_last_fence() - o->fence; int ok = mtl_wait(o->fence, timeout);
+        sp_note(now_ns() - t0, lag, !ok);
+        return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    }
     return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+}
+static void sp_report(uint64_t frames) {   // every 300 presents
+    static uint64_t t_prev; uint64_t t = now_ns(); double wall = t_prev ? (t - t_prev) / 1e6 : 0; t_prev = t;
+    if (!wall) return;
+    void mtl_syncprof_take(uint64_t *, uint64_t *, uint64_t[4], uint64_t *, uint64_t *);
+    uint64_t busy, cbs, eff[4], gap, gaps; mtl_syncprof_take(&busy, &cbs, eff, &gap, &gaps);
+    char line[1400]; int o = snprintf(line, sizeof line, "[nvn] syncprof up to frame %llu: %.1f ms a frame; GPU busy %.0f%% (%.2f ms a frame, %.1f command buffers), idle between them %.2f ms a frame (%.1f gaps); effects: events %llu, counters %llu, occlusion %llu; SyncWait calls %llu (signaled %llu, unfenced %llu); QueueFinish %llu (%.2f ms a frame); blocking waits:",
+                     (unsigned long long)frames, wall / 300, 100.0 * busy / 1e6 / wall, busy / 1e6 / 300, cbs / 300.0, gap / 1e6 / 300, gaps / 300.0, (unsigned long long)eff[1], (unsigned long long)eff[2], (unsigned long long)eff[3],
+                     (unsigned long long)atomic_exchange(&g_sp_calls, 0), (unsigned long long)atomic_exchange(&g_sp_signaled, 0), (unsigned long long)atomic_exchange(&g_sp_unfenced, 0),
+                     (unsigned long long)atomic_exchange(&g_sp_finish, 0), atomic_exchange(&g_sp_finish_ns, 0) / 1e6 / 300);
+    pthread_mutex_lock(&g_sp_mu);
+    for (int i = 0; i < 8 && g_sp_thr[i].name[0]; i++) { sp_thr *h = &g_sp_thr[i];
+        if (h->n) o += snprintf(line + o, sizeof line - o, " '%s' %llu blocked %.2f ms a frame (newest fence %llu, 1 behind %llu, more %llu%s)", h->name, (unsigned long long)h->n, h->ns / 1e6 / 300,
+                                (unsigned long long)h->lag[0], (unsigned long long)h->lag[1], (unsigned long long)h->lag[2], h->timeouts ? ", timeouts" : "");
+        h->n = h->ns = h->timeouts = 0; memset(h->lag, 0, sizeof h->lag); }
+    pthread_mutex_unlock(&g_sp_mu);
+    LOG("%s", line);
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -669,7 +704,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; int mtl_syncprof(void); if (mtl_syncprof()) { uint64_t t0 = now_ns(); mtl_finish(); atomic_fetch_add(&g_sp_finish, 1); atomic_fetch_add(&g_sp_finish_ns, now_ns() - t0); } else mtl_finish(); }
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1616,6 +1651,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     dm_fps_lock_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
     if (fstep_on()) fstep_tick(o);
+    if (mtl_syncprof() && o->presents % 300 == 0) sp_report(o->presents);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);
     {
