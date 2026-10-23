@@ -8405,6 +8405,10 @@ int mtl_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("
 uint64_t mtl_snap_take_wait(void) { return atomic_exchange(&g_snap_wait_ns, 0); }
 // Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before)
 static uint64_t snap_take(const tex_t *t) {
+    // With the encoding thread (DM_NVN_ENC_THREAD, the default on iOS) the frame's work may still sit in its record queue when another thread presents (Breath of the Wild's
+    // Presentation Thread): a copy committed now would run before it. A GPU wait for the frame's fence would hold the queue in front of that very commit, so the frame is
+    // presented as before instead
+    if (rec_on() && !on_sub_thread()) { static int once; if (!once++) MLOG("present snapshots: off for presents from another thread while Metal encoding runs on its own thread (DM_NVN_ENC_THREAD)"); return 0; }
     id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
     if (!g_snap_ev) {
         g_snap_ev = [g_dev newSharedEvent];
@@ -8438,7 +8442,7 @@ static uint64_t snap_take(const tex_t *t) {
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     [ce endEncoding]; [cb endCommandBuffer];
-    if (on_sub_thread()) rec_drain();   // after everything the encoding thread still holds of the frame
+    if (on_sub_thread()) rec_drain();   // after everything the encoding thread still holds of the frame (presents from the submitting thread)
     [g_q4 commit:&cb count:1];
     g_snap[k].ev = ++g_snap_v; [g_q4 signalEvent:g_snap_ev value:g_snap[k].ev];
     return g_snap[k].serial;
