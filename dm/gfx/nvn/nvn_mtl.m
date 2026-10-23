@@ -285,7 +285,8 @@ static void udc_selftest(void) {
 // M2 Max, on AC power and on battery, thermal pressure nominal), GPU time a frame 9 → 14 ms, 25-30 dropped frames out of 300. A thread of its own then keeps one small dispatch
 // (one threadgroup of 32 threads, about 0.5 ms) running on a queue of its own whenever none of the game's submissions is on the GPU: from the completion of the last one in
 // flight to the next commit, so it never adds to the GPU time of the game's own work, which the frame step reads; filling only 2 ms of each gap (90% busy) still let the clock fall.
-// It starts only when frames come late (mtl_gpu_fill_frame: a tenth of 120 presents over the frame period by a quarter) and stops after a hold without late frames, which doubles at
+// It starts only when frames come late (mtl_gpu_fill_frame: one in 20 of 120 presents over the frame period by a tenth, as the frame step counts late frames;
+// a quarter and one in 10 never started it in Breath of the Wild's Zora's Domain, which then ran at 444 MHz with 11% of its frames late) and stops after a hold without late frames, which doubles at
 // each new start (60 s up to 16 min), so a game that never comes late never pays for it. Paused for suspension (mtl_gpu_fill_pause) and when no submission came for 250 ms
 static _Atomic uint64_t g_fill_commit, g_fill_done;   // the game's submissions committed / completed on the GPU
 static _Atomic uint64_t g_fill_last;   // time of the last commit
@@ -336,9 +337,9 @@ static void fill_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; p
 void mtl_gpu_fill_frame(double shown_ms, double period_ms) {
     int mode = fill_mode(); if (mode != 2) { if (mode == 1 && !atomic_load(&g_fill_on)) { fill_start(); MLOG("GPU filler: on from the start (DM_GPU_FILL=1)"); } return; }
     static int n, late, starts; static uint64_t on_since, quiet_since; static double hold_s = 60;
-    n++; if (period_ms > 0 && shown_ms > period_ms * 1.25) late++;
+    n++; if (period_ms > 0 && shown_ms > period_ms * 1.1) late++;
     if (n < 120) return;
-    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int was_late = late * 10 >= n; n = late = 0;
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int was_late = late * 20 >= n; n = late = 0;
     if (was_late) {
         quiet_since = 0;
         if (!atomic_load(&g_fill_on)) {
