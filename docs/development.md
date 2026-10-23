@@ -187,6 +187,10 @@ Notes on these steps:
 - The unsigned build pins its build product and intermediate directories inside `$W/build/ios/pkg/dd`, independently of Xcode's Locations preference.
 - hactool cannot read every update (Mario 1.2.1's patch NCA gives "Invalid BKTR layout!"), which is why `nx_extract` uses LibHac.
 
+## Mac app with a launcher
+
+`dm/mac/make_app.sh <title ID> <NSP folder> [overlay folder [label]]` packs a prepared game (after `scripts/build_ipa_from_nsp.py`, with its extracted files kept) as `<NSP folder>/mac/<game name>.app`: the host built for the profile and a launcher window (`dm/mac/Launcher.swift`, SwiftUI) that shows before the game, like the iOS launcher. It offers what the profile supports: resolution (`output_size` → `DM_OUTPUT_SIZE`, `render_pool` → `DM_RENDER_SCALE`), frame rate (30 / 60, and 120 / 144 on a screen that reaches it with `fps_max` or an `fps_target` above 60), sharpening, console mode, game language, full screen, the Metal HUD, and a switch for the overlay folder (`DM_ROMFS_OVERLAY`, e.g. files from the PC version the player owns). Play replaces the launcher with the host (`execv`), so the game runs as the app, with its Dock icon and Game Mode in full screen. The choices are kept per app; variables already in the environment win. The game files stay in the build folder, found by absolute path (`Contents/Resources/game.json`), so moving the NSP folder needs the app packed again; the log is `<title ID>_build/run/log.txt`.
+
 ## Prewarm lists
 
 Metal compiles each combination of shaders and pipeline settings for the GPU the first time it is used. Each takes tens of milliseconds, so a burst of them on entering a level is a visible freeze. The host records what it had to compile and rebuilds those pipelines on a background queue at the next launch:
