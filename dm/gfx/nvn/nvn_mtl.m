@@ -277,6 +277,83 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+// GPU filler (macOS; DM_GPU_FILL=0 never, =1 from the start, on iOS too). macOS lowers the GPU clock while the GPU idles part of each frame, even when every frame then misses its
+// deadline, and has no interface to ask for a clock. A game that waits for its own frame on the GPU (Breath of the Wild waits for the fence of the frame it just submitted) leaves
+// the GPU idle while the host translates the next one: after 50 to 130 s the clock fell from 1398 to 444 MHz in about 4 s and stayed there at 95% load (powermetrics, MacBook Pro
+// M2 Max, on AC power and on battery, thermal pressure nominal), GPU time a frame 9 → 14 ms, 25-30 dropped frames out of 300. A thread of its own then keeps one small dispatch
+// (one threadgroup of 32 threads, about 0.5 ms) running on a queue of its own whenever none of the game's submissions is on the GPU: from the completion of the last one in
+// flight to the next commit, so it never adds to the GPU time of the game's own work, which the frame step reads; filling only 2 ms of each gap (90% busy) still let the clock fall.
+// It starts only when frames come late (mtl_gpu_fill_frame: a tenth of 120 presents over the frame period by a quarter) and stops after a hold without late frames, which doubles at
+// each new start (60 s up to 16 min), so a game that never comes late never pays for it. Paused for suspension (mtl_gpu_fill_pause) and when no submission came for 250 ms
+static _Atomic uint64_t g_fill_commit, g_fill_done;   // the game's submissions committed / completed on the GPU
+static _Atomic uint64_t g_fill_last;   // time of the last commit
+static _Atomic int g_fill_on, g_fill_pause, g_fill_busy;
+static pthread_mutex_t g_fill_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_fill_cv = PTHREAD_COND_INITIALIZER;
+static int fill_mode(void) {   // 0 never, 1 from the start, 2 when frames come late
+    static int v = -1; if (v >= 0) return v;
+    const char *e = getenv("DM_GPU_FILL");
+#if TARGET_OS_OSX
+    v = e ? atoi(e) : 2;
+#else
+    v = e ? atoi(e) : 0;
+#endif
+    if (v < 0 || v > 2) v = 2;
+    return v;
+}
+static void fill_wake(void) { pthread_mutex_lock(&g_fill_mu); pthread_cond_broadcast(&g_fill_cv); pthread_mutex_unlock(&g_fill_mu); }
+static int fill_gap(void) { return atomic_load(&g_fill_done) == atomic_load(&g_fill_commit) && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - atomic_load(&g_fill_last) < 250000000ull; }
+static void *fill_main(void *arg) {
+    (void)arg; pthread_setname_np("dm-gpu-fill");
+    NSError *e = nil;
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void spin(device uint *o [[buffer(0)]], constant uint &n [[buffer(1)]], uint t [[thread_position_in_grid]]) { uint x = t; for (uint i = 0; i < n; i++) x = x * 1664525u + 1013904223u; if (x == 0x9e3779b9u) o[0] = x; }" options:nil error:&e];
+    id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"spin"] error:&e] : nil;
+    if (!ps) { MLOG("[RED] GPU filler: no pipeline (%s): the GPU clock may drop while the game runs", e.description.UTF8String); return NULL; }
+    id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> out = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    uint32_t n = 1 << 14;
+    for (;;) @autoreleasepool {
+        pthread_mutex_lock(&g_fill_mu);
+        while (!atomic_load(&g_fill_on) || atomic_load(&g_fill_pause) || !fill_gap()) {
+            atomic_store(&g_fill_busy, 0);
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 50000000; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&g_fill_cv, &g_fill_mu, &ts);   // woken by completions; the timeout covers the 250 ms idle rule
+        }
+        atomic_store(&g_fill_busy, 1);
+        pthread_mutex_unlock(&g_fill_mu);
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:ps]; [ce setBuffer:out offset:0 atIndex:0]; [ce setBytes:&n length:4 atIndex:1];
+        [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [ce endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;   // about 0.5 ms each, so a commit of the game's waits at most that long
+        if (ms > 0) { if (ms < 0.35 && n < (1u << 26)) n += n / 2; else if (ms > 0.8 && n > 256) n -= n / 3; }
+    }
+    return NULL;
+}
+static void fill_thread(void) { pthread_t th; if (!pthread_create(&th, NULL, fill_main, NULL)) pthread_detach(th); }
+static void fill_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, fill_thread); atomic_store(&g_fill_on, 1); fill_wake(); }
+// Once per present (hle_nvn.c), with the time since the previous present and the frame period the game is paced to
+void mtl_gpu_fill_frame(double shown_ms, double period_ms) {
+    int mode = fill_mode(); if (mode != 2) { if (mode == 1 && !atomic_load(&g_fill_on)) { fill_start(); MLOG("GPU filler: on from the start (DM_GPU_FILL=1)"); } return; }
+    static int n, late, starts; static uint64_t on_since, quiet_since; static double hold_s = 60;
+    n++; if (period_ms > 0 && shown_ms > period_ms * 1.25) late++;
+    if (n < 120) return;
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int was_late = late * 10 >= n; n = late = 0;
+    if (was_late) {
+        quiet_since = 0;
+        if (!atomic_load(&g_fill_on)) {
+            if (starts++) hold_s = hold_s * 2 < 960 ? hold_s * 2 : 960;
+            on_since = t; fill_start();
+            MLOG("GPU filler: on, frames came late (start %d; it stops after %.0f s without late frames; DM_GPU_FILL=0 turns it off)", starts, hold_s);
+        }
+    } else if (atomic_load(&g_fill_on)) {
+        if (!quiet_since) quiet_since = t;
+        if (t - quiet_since > (uint64_t)(hold_s * 1e9)) { atomic_store(&g_fill_on, 0); MLOG("GPU filler: off after %.0f s without late frames (on for %.0f s)", hold_s, (t - on_since) / 1e9); }
+    }
+}
+// Suspension: no filler work may run (iOS forbids GPU work in the background); waits until its last dispatch has completed
+void mtl_gpu_fill_pause(int on) {
+    atomic_store(&g_fill_pause, on != 0);
+    if (on) { fill_wake(); for (int i = 0; i < 500 && atomic_load(&g_fill_busy); i++) usleep(1000); }
+}
 void mtl_init(void) {
     if (g_dev) return;
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
@@ -1222,6 +1299,7 @@ uint64_t mtl_sub_commit(void) {
     g_cut_copy = 0;
     uint64_t fence = ++g_fence;
     if (mtl_syncprof()) for (int i = 0; i < g_npost; i++) atomic_fetch_add(&g_sp_eff[g_post[i].kind & 3], 1);
+    atomic_fetch_add(&g_fill_commit, 1); atomic_store(&g_fill_last, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));   // the GPU filler stops before the next dispatch
     gw_commit(fence);
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // CPU-visible effects after completion: copy the op table into the callback
@@ -1235,6 +1313,7 @@ uint64_t mtl_sub_commit(void) {
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        if (atomic_fetch_add(&g_fill_done, 1) + 1 == atomic_load(&g_fill_commit) && atomic_load(&g_fill_on)) fill_wake();   // a gap begins
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         for (int i = 0; i < n; i++) {

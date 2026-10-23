@@ -268,6 +268,7 @@ Game Freak's Trinity engine on SDK 19 (NVN 55); every shader comes from the Oodl
 | `DM_NVN_GPUPROF=f` or `f1-f2` | GPU start and duration of every encoder of those frames, from Metal 4 counter heap timestamps (`[gpuprof]` lines: kind, size, attachments, draws, command-buffer segment; a `frame` line with render and compute / copy time and the span from first start to last end) |
 | `DM_NVN_ENC_THREAD=1` | Metal encoding on a thread of its own: the submit thread records the encoder calls and a worker replays them (`nvn_rec.h`); on by default on iOS (`DM_NVN_ENC_THREAD=0` turns it off), off on macOS |
 | `DM_NVN_UB_LAZY=n` | The most deferred inline uniform updates kept across a render pass end (default 160): they land before the next copy, a draw or dispatch that reads their memory other than through uniform bindings the shadows cover (`ubd_conflict`, `ubd_conflict_cs`), a transform feedback draw, or the end of the submission, instead of at every pass end; 0 lands them at every pass end, as before |
+| `DM_GPU_FILL=0` / `1` | The GPU filler (macOS, `nvn_mtl.m`): never, or from the start (also on iOS). By default it starts on the Mac when a tenth of 120 presents come late, fills only while none of the game's submissions is on the GPU, and stops after a hold without late frames |
 | `DM_NVN_UB_COPY_THREAD=0` | Uniform shadows of 512 bytes or more are copied on the submit thread, as before (by default a worker copies them) |
 | `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog` | Metal validation without aborting |
 
