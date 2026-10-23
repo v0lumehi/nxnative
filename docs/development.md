@@ -182,6 +182,7 @@ Notes on these steps:
 - The icon is the `icon.jpg` that `nx_extract` saves next to `RomFS/`; `DM_ICON=` points at another image.
 - `DM_ENV_FILE=` bakes environment switches into the app, and `DM_DISPLAY_NAME=` renames it.
 - `DM_LANG=<code>` is the game language (`DMLanguage` in `Info.plist`, default `en-US`; `main.m` sets `DM_LANG` from it unless `Documents/env.txt` or the baked env file sets it).
+- `DM_PRESENT_SHARPEN=0.0`–`1.0` sharpens the picture as it is presented (AMD's contrast adaptive sharpening, FidelityFX CAS, in the present shader `nvn_mtl.m` `present_pipeline`; off by default, on the Mac and the iPhone, for NVN and Vulkan games alike). It makes edges and fine contrast crisper without adding detail, and holds back where the neighbourhood is already near black or white, so hard edges do not ring; Hades' Switch art at 0.6 came nearer the PC version's look but not to it.
 - `DM_SHOW_FPS=1` turns the frame-rate counter on (`DMShowFPS` in `Info.plist`, which `front_ios.m` reads; `DM_SHOW_FPS` in `Documents/env.txt` overrides it). It counts the frames put on screen each second (`mtl_present_count`), so frames the display link merges away are not counted.
 - The unsigned build pins its build product and intermediate directories inside `$W/build/ios/pkg/dd`, independently of Xcode's Locations preference.
 - hactool cannot read every update (Mario 1.2.1's patch NCA gives "Invalid BKTR layout!"), which is why `nx_extract` uses LibHac.

@@ -351,7 +351,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -8105,8 +8105,16 @@ static void present_pipeline(MTLPixelFormat format) {
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
-            "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
+            "struct Crop { float4 rect; float4 edge; float4 sh; };\n"   // sh: sharpening (DM_PRESENT_SHARPEN) strength, source texel size
+            // Sharpening: AMD's Contrast Adaptive Sharpening (FidelityFX CAS, MIT) on the centre texel and its four neighbours in the source; the weight shrinks where the
+            // neighbourhood is already near black or white, so hard edges do not ring
+            "float3 tap(texture2d<float> t, sampler s, constant Crop& c, float2 uv) { return t.sample(s, clamp(uv, c.edge.xy, c.edge.zw)).rgb; }\n"
+            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
+            "  float2 uv = in.uv * c.rect.zw + c.rect.xy; float3 e = tap(t, s, c, uv); if (c.sh.x <= 0) return float4(e, 1);\n"
+            "  float3 b = tap(t, s, c, uv - float2(0, c.sh.z)), d = tap(t, s, c, uv - float2(c.sh.y, 0)), f = tap(t, s, c, uv + float2(c.sh.y, 0)), h = tap(t, s, c, uv + float2(0, c.sh.z));\n"
+            "  float3 mn = min(min(min(b, d), min(f, h)), e), mx = max(max(max(b, d), max(f, h)), e);\n"
+            "  float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4))), w = amp * (-1.0 / mix(8.0, 5.0, c.sh.x));\n"
+            "  return float4(saturate((e + (b + d + f + h) * w) / (1.0 + 4.0 * w)), 1); }\n";
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
@@ -8134,6 +8142,14 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
     if (!v && (v = [src newTextureViewWithPixelFormat:pf])) { if (views[next]) defer_obj_unref(views[next]); views[next] = v; next = (next + 1) & 3; }
     pthread_mutex_unlock(&mu);
     if (!v) { RED_ONCE(69, "present: cannot create a non-sRGB view of the sRGB swapchain texture (format %lu); presenting the decoded values", (unsigned long)src.pixelFormat); return src; }
+    return v;
+}
+// Sharpening of the presented picture (DM_PRESENT_SHARPEN=0.0 to 1.0, off by default): Hades' characters are soft videos and its Switch packages 720p art, and a little contrast
+// adaptive sharpening brings them nearer the PC version's look; every game can use it
+static float present_sharpen(void) {
+    static float v = -1; if (v >= 0) return v;
+    const char *e = getenv("DM_PRESENT_SHARPEN"); v = e ? strtof(e, NULL) : 0; if (!(v > 0)) v = 0; if (v > 1) v = 1;
+    if (v > 0) MLOG("present: contrast adaptive sharpening %.2f (DM_PRESENT_SHARPEN)", v);
     return v;
 }
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
@@ -8166,8 +8182,9 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height,
+                    present_sharpen(), 1.0f / src.width, 1.0f / src.height, 0};
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -8202,6 +8219,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     float *uv = g_present_uv[uv_i].contents;
     uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
     uv[4] = (cx + 0.5f) / src.width; uv[5] = (cy + 0.5f) / src.height; uv[6] = (cx + cw - 0.5f) / src.width; uv[7] = (cy + ch - 0.5f) / src.height;
+    uv[8] = present_sharpen(); uv[9] = 1.0f / src.width; uv[10] = 1.0f / src.height; uv[11] = 0;
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
