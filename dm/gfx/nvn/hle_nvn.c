@@ -636,6 +636,7 @@ static void sp_note(uint64_t ns, uint64_t lag, int timeout) {
     pthread_mutex_unlock(&g_sp_mu);
 }
 static _Atomic uint64_t g_sp_calls, g_sp_signaled, g_sp_unfenced, g_sp_finish, g_sp_finish_ns;
+_Atomic uint64_t g_sp_pace_ns, g_sp_ticket_ns, g_sp_ticket_n;   // acquire: waiting for the display link tick, and for the texture's previous present (over 0.5 ms counted)
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (mtl_syncprof()) atomic_fetch_add(&g_sp_calls, 1);
@@ -653,10 +654,11 @@ static void sp_report(uint64_t frames) {   // every 300 presents
     if (!wall) return;
     void mtl_syncprof_take(uint64_t *, uint64_t *, uint64_t[4], uint64_t *, uint64_t *);
     uint64_t busy, cbs, eff[4], gap, gaps; mtl_syncprof_take(&busy, &cbs, eff, &gap, &gaps);
-    char line[1400]; int o = snprintf(line, sizeof line, "[nvn] syncprof up to frame %llu: %.1f ms a frame; GPU busy %.0f%% (%.2f ms a frame, %.1f command buffers), idle between them %.2f ms a frame (%.1f gaps); effects: events %llu, counters %llu, occlusion %llu; SyncWait calls %llu (signaled %llu, unfenced %llu); QueueFinish %llu (%.2f ms a frame); blocking waits:",
+    char line[1400]; int o = snprintf(line, sizeof line, "[nvn] syncprof up to frame %llu: %.1f ms a frame; GPU busy %.0f%% (%.2f ms a frame, %.1f command buffers), idle between them %.2f ms a frame (%.1f gaps); effects: events %llu, counters %llu, occlusion %llu; SyncWait calls %llu (signaled %llu, unfenced %llu); QueueFinish %llu (%.2f ms a frame); acquire: tick wait %.2f ms a frame, texture wait %.2f ms a frame (%llu frames over 0.5 ms); blocking waits:",
                      (unsigned long long)frames, wall / 300, 100.0 * busy / 1e6 / wall, busy / 1e6 / 300, cbs / 300.0, gap / 1e6 / 300, gaps / 300.0, (unsigned long long)eff[1], (unsigned long long)eff[2], (unsigned long long)eff[3],
                      (unsigned long long)atomic_exchange(&g_sp_calls, 0), (unsigned long long)atomic_exchange(&g_sp_signaled, 0), (unsigned long long)atomic_exchange(&g_sp_unfenced, 0),
-                     (unsigned long long)atomic_exchange(&g_sp_finish, 0), atomic_exchange(&g_sp_finish_ns, 0) / 1e6 / 300);
+                     (unsigned long long)atomic_exchange(&g_sp_finish, 0), atomic_exchange(&g_sp_finish_ns, 0) / 1e6 / 300,
+                     atomic_exchange(&g_sp_pace_ns, 0) / 1e6 / 300, atomic_exchange(&g_sp_ticket_ns, 0) / 1e6 / 300, (unsigned long long)atomic_exchange(&g_sp_ticket_n, 0));
     pthread_mutex_lock(&g_sp_mu);
     for (int i = 0; i < 8 && g_sp_thr[i].name[0]; i++) { sp_thr *h = &g_sp_thr[i];
         if (h->n) o += snprintf(line + o, sizeof line - o, " '%s' %llu blocked %.2f ms a frame (newest fence %llu, 1 behind %llu, more %llu%s)", h->name, (unsigned long long)h->n, h->ns / 1e6 / 300,
@@ -1274,7 +1276,9 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
         rt_comp_tick(rtp);
         uint64_t p0 = now_ns();
-        if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        static int ahead = -1; if (ahead < 0) { const char *e = getenv("DM_PACE_AHEAD"); int mtl_snap_on(void); ahead = (e && atoi(e) > 0) || mtl_snap_on(); if (ahead) LOG("[nvn] a frame starts as soon as its swapchain texture is free, not on the next display link tick (DM_PACE_AHEAD / DM_PRESENT_SNAP)"); }
+        if (ahead && mtl_link_active()) { uint64_t mtl_snap_take_wait(void); pace_ns += mtl_snap_take_wait(); }   // the texture's previous present (or the snapshot ring, nvn_mtl.m) holds the game at most a frame or two ahead of the screen; its wait is pacing, not the frame's cost
+        else if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
         pace_ns = now_ns() - p0;
     } else {   // DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
@@ -1284,9 +1288,12 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    { extern _Atomic uint64_t g_sp_pace_ns; atomic_fetch_add(&g_sp_pace_ns, pace_ns); }
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; extern _Atomic uint64_t g_sp_ticket_ns, g_sp_ticket_n; uint64_t d = now_ns() - w0; atomic_fetch_add(&g_sp_ticket_ns, d); if (d > 500000) atomic_fetch_add(&g_sp_ticket_n, 1);
+        static int ahead_ = -1; if (ahead_ < 0) { const char *e = getenv("DM_PACE_AHEAD"); ahead_ = e && atoi(e) > 0; }
+        if (ahead_) pace_ns += d; }   // DM_PACE_AHEAD: the texture wait paces the frame, so the frame step does not count it as the frame's CPU cost
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;

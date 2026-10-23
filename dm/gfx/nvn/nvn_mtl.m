@@ -1294,7 +1294,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[110];
+static int g_red_once[112];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -8390,6 +8390,59 @@ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_v
     if (ev && !g_ext_ev) g_ext_ev = (__bridge id<MTLSharedEvent>)ev;
     return present_enqueue(&t, period, crop, ev ? ev_val : 0);
 }
+// Present snapshots (DM_PRESENT_SNAP=1, experiment). A game with two swapchain textures (Breath of the Wild) gets a texture back only when its previous present has been taken by the
+// display link on a tick, so the next frame's CPU work waits for the tick and the GPU idles in between: macOS reads that idle time as room and lowers the GPU clock to its floor
+// (444 MHz on an M2 Max), where 11.7 ms of GPU work a frame plus the time to the first segment no longer fits 16.7 ms. With snapshots each present is copied on the game's queue,
+// right after the frame's work, into a texture of the host's own (a ring of SNAP_N), the display link shows the copy, and the game's texture is free at once: the game can run one
+// frame ahead of the screen, so the GPU always has the next frame queued. A ring slot is reused once its present has been processed (at most SNAP_N frames between the game and the
+// screen); the time the presenting thread waits for a slot paces the frame (mtl_snap_take_wait, which the frame step counts as waiting, not as the frame's cost)
+#define SNAP_N 2
+static struct { id<MTLTexture> tex; uint64_t serial, ticket, ev; } g_snap[SNAP_N];
+static id<MTL4CommandAllocator> g_snap_alloc[SNAP_N]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_N];
+static id<MTLResidencySet> g_snap_res; static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v, g_snap_next;
+static _Atomic uint64_t g_snap_wait_ns;
+int mtl_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_SNAP"); v = e && atoi(e) > 0; if (v) MLOG("present snapshots (DM_PRESENT_SNAP=1, experiment): each present is copied into a host texture and the game's texture is free at once"); } return v; }
+uint64_t mtl_snap_take_wait(void) { return atomic_exchange(&g_snap_wait_ns, 0); }
+// Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before)
+static uint64_t snap_take(const tex_t *t) {
+    id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
+    if (!g_snap_ev) {
+        g_snap_ev = [g_dev newSharedEvent];
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new]; rd.initialCapacity = SNAP_N; NSError *e = nil;
+        g_snap_res = [g_dev newResidencySetWithDescriptor:rd error:&e]; if (!g_snap_res) MDIE("present snapshots: no residency set: %s", e.localizedDescription.UTF8String);
+        [g_q4 addResidencySet:g_snap_res];
+        for (int i = 0; i < SNAP_N; i++) {
+            g_snap_alloc[i] = [g_dev newCommandAllocator]; g_snap_cb[i] = [g_dev newCommandBuffer];
+            if (!g_snap_alloc[i] || !g_snap_cb[i]) MDIE("present snapshots: no command allocator / buffer");
+        }
+    }
+    int k = (int)(g_snap_next++ % SNAP_N);
+    uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (g_snap[k].ticket) mtl_present_wait(g_snap[k].ticket);   // its last present has been processed: the display's blit from it is on the queue before this copy
+    if (g_snap[k].ev && ![g_snap_ev waitUntilSignaledValue:g_snap[k].ev timeoutMS:2000]) RED_ONCE(110, "present snapshots: the previous copy into a ring slot did not finish within 2 s");
+    atomic_fetch_add(&g_snap_wait_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0);
+    id<MTLTexture> dst = g_snap[k].tex;
+    if (!dst || dst.width != src.width || dst.height != src.height || dst.pixelFormat != src.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+        if (dst) [g_snap_res removeAllocation:dst];
+        dst = [g_dev newTextureWithDescriptor:d]; if (!dst) { RED_ONCE(111, "present snapshots: no texture"); return 0; }
+        [g_snap_res addAllocation:dst]; [g_snap_res commit];
+        if (!g_snap[k].serial) { static _Atomic uint64_t n; g_snap[k].serial = (1ull << 61) + atomic_fetch_add(&n, 1) + 1; }
+        serial_put(g_snap[k].serial, dst); g_snap[k].tex = dst;
+        MLOG("present snapshots: ring slot %d %lux%lu format %lu", k, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat);
+    }
+    [g_snap_alloc[k] reset];
+    id<MTL4CommandBuffer> cb = g_snap_cb[k];
+    [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [ce endEncoding]; [cb endCommandBuffer];
+    if (on_sub_thread()) rec_drain();   // after everything the encoding thread still holds of the frame
+    [g_q4 commit:&cb count:1];
+    g_snap[k].ev = ++g_snap_v; [g_q4 signalEvent:g_snap_ev value:g_snap[k].ev];
+    return g_snap[k].serial;
+}
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
     if (atomic_load(&g_present_discard)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
@@ -8401,14 +8454,17 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         if (st == 1 && link_on() && now - t0 >= at) { st = 2; mtl_link_pause(1); MLOG("DM_TEST_LINK_STALL: pausing the display link for %.1f s (frame %llu)", dur, (unsigned long long)atomic_load(&g_cur_frame)); }
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
+    tex_t snap; uint64_t ss = 0; int slot = (int)(g_snap_next % SNAP_N);
+    if (t && !ev_val && mtl_snap_on() && (ss = snap_take(t))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
     pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
+    if (ss) g_snap[slot].ticket = tk;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
-    return tk;
+    return ss ? 0 : tk;   // a snapshot: the game's texture is free now (its later draws come after the copy on the queue)
 }
 // Do not wait during discard: the frame enqueued only after the flag was set (the present thread had just passed the flag check) has nobody to take it, and waiting for it would stall again; it is left for the following mtl_drain to clear
 // Do not wait indefinitely in display-link mode: see the note at STALL_NS. Only frames "not yet taken by the display link" are dropped; the one already on its way to the screen is waited for until handed to the GPU (same dropping as when entering the background)
