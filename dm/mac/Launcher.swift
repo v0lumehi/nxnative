@@ -176,7 +176,7 @@ struct LauncherView: View {
                 .controlSize(.large).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 480, height: 720)   // tall enough for every section without scrolling (a Form sized to its content collapsed and hid the lower sections)
     }
 
     func chooseOverlay() {
