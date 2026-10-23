@@ -1492,13 +1492,25 @@ VK(vkGetSwapchainImagesKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint32_t *n
     uint32_t k = umin(*n, sc->n); memcpy(out, sc->img, k * sizeof *out); *n = k; return k < sc->n ? VK_INCOMPLETE : VK_SUCCESS;
 }
 static uint64_t g_next_acq;   // pacing without the display link: the earliest time of the next acquire (one frame period after the previous one)
+// Frame rate of a game that steps by the time that passed (profile fps_max above 60, Hades): DM_FPS_TARGET above 60, up to fps_max, presents FIFO at that rate, and 30 saves power.
+// A game that steps a fixed amount per frame (Super Mario Galaxy's Hagi layer) keeps the game's own rate: it would run fast, or at half speed. The display link runs at that rate
+// (nvn_mtl.m link_range mode 4)
+static int vk_fps_set(void) {
+    static int v = -1; if (v >= 0) return v;
+    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : 0; v = 0;
+    if (DM_GAME_FPS_MAX > 60 && (t == 30 || (t > 60 && t <= DM_GAME_FPS_MAX))) { v = t; VLOG("presents at %d fps (DM_FPS_TARGET)", v); }
+    else if (e && t && t != 60) VLOG("[RED] DM_FPS_TARGET=%s: the game keeps its speed only at its own frame rate%s; presenting as the game asks", e, DM_GAME_FPS_MAX > 60 ? " or at 30 to the profile's fps_max" : " (no fps_max in its profile)");
+    return v;
+}
+static int vk_fps(void) { int v = vk_fps_set(); return v ? v : mtl_fps_target(); }
+int dm_vk_var_fps(void) { int v = vk_fps_set(); return v > 60 ? v : 0; }   // hle_nvn.c nvn_var_fps: the display link at this rate
 VKB(vkAcquireNextImageKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence f, uint32_t *idx) {
     (void)d; (void)timeout; (void)sem;
     uint32_t i = sc->next++ % sc->n;
-    uint64_t period = 1000000000ull / (uint64_t)mtl_fps_target(), now = now_ns();
+    int fps = vk_fps(); uint64_t period = 1000000000ull / (uint64_t)fps, now = now_ns();
     // Paced by the display link when it runs, as NVN's acquire (hle_nvn.c nvnWindowAcquireTexture): FIFO presents one frame per vsync. A clock of our own drifts against the screen:
     // Super Mario Galaxy 2 on an iPhone put two frames into some display-link ticks and none into others (about one tick in seven), and on a Mac window it ran at 30 fps
-    if (mtl_link_active() && mtl_link_wait_tick((int)(60 / mtl_fps_target()), 2 * period)) g_next_acq = now_ns() + period;
+    if (mtl_link_active() && mtl_link_wait_tick(fps > 60 ? 0 : 60 / fps, 2 * period)) g_next_acq = now_ns() + period;   // above 60: the next tick of the faster link
     else {
         if (g_next_acq > now) { uint64_t w = g_next_acq - now; struct timespec ts = {(time_t)(w / 1000000000ull), (long)(w % 1000000000ull)}; nanosleep(&ts, NULL); }
         now = now_ns(); g_next_acq = g_next_acq && now < g_next_acq + period ? g_next_acq + period : now + period;
@@ -1524,7 +1536,7 @@ VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         VkSwapchainKHR sc = pi->pSwapchains[i]; uint32_t k = pi->pImageIndices[i];
         int fit = crop[2] > 0 && crop[3] > 0 && k < sc->n && (uint32_t)(crop[0] + crop[2]) <= sc->img[k]->w && (uint32_t)(crop[1] + crop[3]) <= sc->img[k]->h;
-        if (k < sc->n) sc->ticket[k] = mtl_present_ext(sc->img[k]->serial, 1.0 / mtl_fps_target(), (__bridge void *)g_ev, v, fit ? crop : NULL);
+        if (k < sc->n) sc->ticket[k] = mtl_present_ext(sc->img[k]->serial, 1.0 / vk_fps(), (__bridge void *)g_ev, v, fit ? crop : NULL);
         if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
     dm_gfx_leave();

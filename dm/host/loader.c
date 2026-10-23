@@ -229,11 +229,11 @@ void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const module_t *m = g_fps_m; const char *name = m->name;
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-    if (t != 0 && t != 30 && t != 60 && !(m->var_step && t > 60 && t <= 240)) {
+    if (t != 0 && t != 30 && t != 60 && !(m->var_step && t > 60 && t <= 240) && !(t > 60 && t <= DM_GAME_FPS_MAX)) {   // fps_max: the game's own step keeps its speed there (hle_vk.m)
         LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60%s; using the game's own frame step", e, m->var_step ? " or 61 to 240" : " (above 60 only on a build with a variable frame step)"); t = 0;
     }
     float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
-    dm_fps_var_cap = t > 60 ? t : 0;
+    dm_fps_var_cap = m->var_step && t > 60 ? t : 0;
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
     // another factor fixes the size at that multiple (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written at target 0 too. Above 1.0 (up to 3.0) only on a build whose
     // stubs grow its render buffer pool (RENDER_POOL), and only on the Mac: the pool's growth comes on top of the guest's address space, which iOS caps at a 6 GB reservation (hle_svc.c)
@@ -266,8 +266,20 @@ void dm_fps_state_apply(void) {
             LOG("%s: output %ux%u in place of %llux%llu (DM_RENDER_SCALE %.2f)", name, ow, oh, (unsigned long long)m->out_w, (unsigned long long)m->out_h, sc);
         }
     }
+    // Any output size, for a build whose stubs take it (OUTPUT_W / OUTPUT_H; Hades sets 1280x720 docked too): DM_OUTPUT_SIZE=WxH (640x360 to 7680x4320), 1080p, 1440p or 4k. It
+    // replaces the size a render scale above 1.0 gave (above)
+    const char *os = getenv("DM_OUTPUT_SIZE");
+    if (os && m->out_w) {
+        unsigned w = 0, h = 0;
+        if (!strcmp(os, "1080p")) w = 1920, h = 1080; else if (!strcmp(os, "1440p")) w = 2560, h = 1440; else if (!strcmp(os, "4k") || !strcmp(os, "4K")) w = 3840, h = 2160; else sscanf(os, "%ux%u", &w, &h);
+        if (w >= 640 && h >= 360 && w <= 7680 && h <= 4320) {
+            uint64_t osz = (uint64_t)h << 32 | w; float owf = (float)w;
+            memcpy(dm_fps_state + 0x40, &osz, sizeof osz); memcpy(dm_fps_state + 0x48, &owf, sizeof owf);
+            LOG("%s: output %ux%u in place of %llux%llu (DM_OUTPUT_SIZE)", name, w, h, (unsigned long long)m->out_w, (unsigned long long)m->out_h);
+        } else LOG("[RED] DM_OUTPUT_SIZE=%s: must be WxH (640x360 to 7680x4320), 1080p, 1440p or 4k; keeping %llux%llu", os, (unsigned long long)m->out_w, (unsigned long long)m->out_h);
+    } else if (os) LOG("[RED] DM_OUTPUT_SIZE=%s: this build has no output size stub; keeping the game's size", os);
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
-    LOG("%s: frame step %s%s (%s)", name, !t ? "as the game sets it" : t > 60 ? "variable, the time each frame took" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+    LOG("%s: frame step %s%s (%s)", name, !t ? "as the game sets it" : t > 60 ? (m->var_step ? "variable, the time each frame took" : "the game's own, by the time that passed (fps_max)") : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
