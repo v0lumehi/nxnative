@@ -20,8 +20,8 @@ struct GameConfig: Decodable {
     let renderPool: Bool        // the profile has render_pool: render scale above 1.0 (Breath of the Wild)
     let docked: Bool            // the profile's op_mode
     let languages: [String]
-    let overlay: String?        // optional game file overlay (DM_ROMFS_OVERLAY), e.g. assets from the PC version the player owns
-    let overlayLabel: String?
+    let overlay: String?        // a preset replacement folder (DM_ROMFS_OVERLAY) until the player picks one in the launcher
+    let overlayLabel: String?   // the note under the folder choice
 }
 
 let config: GameConfig? = {
@@ -47,6 +47,7 @@ final class Settings: ObservableObject {
     @Published var fullscreen: Bool
     @Published var hud: Bool
     @Published var overlay: Bool
+    @Published var overlayPath: String   // the folder whose files replace the game's (DM_ROMFS_OVERLAY); empty = none
 
     init(_ c: GameConfig) {
         resolution = defaults.string(forKey: "resolution") ?? "game"
@@ -58,10 +59,11 @@ final class Settings: ObservableObject {
         fullscreen = defaults.object(forKey: "fullscreen") as? Bool ?? true
         hud = defaults.bool(forKey: "hud")
         overlay = defaults.object(forKey: "overlay") as? Bool ?? true
+        overlayPath = defaults.string(forKey: "overlayPath") ?? (c.overlay ?? "")
     }
 
     func save() {
-        for (k, v) in ["resolution": resolution, "fps": fps, "sharpen": sharpen, "docked": docked, "language": language, "fullscreen": fullscreen, "hud": hud, "overlay": overlay] as [String: Any] {
+        for (k, v) in ["resolution": resolution, "fps": fps, "sharpen": sharpen, "docked": docked, "language": language, "fullscreen": fullscreen, "hud": hud, "overlay": overlay, "overlayPath": overlayPath] as [String: Any] {
             defaults.set(v, forKey: k)
         }
     }
@@ -81,7 +83,7 @@ final class Settings: ObservableObject {
             e["DM_FPS_TARGET"] = String(fps)
             if fps > 60 { e["DM_PRESENT_HZ"] = String(fps); e["DM_PRESENT_LINK"] = "2" }
         }
-        if overlay, let o = c.overlay { e["DM_ROMFS_OVERLAY"] = o }
+        if overlay && !overlayPath.isEmpty && FileManager.default.fileExists(atPath: overlayPath) { e["DM_ROMFS_OVERLAY"] = overlayPath }
         return e
     }
 }
@@ -153,7 +155,19 @@ struct LauncherView: View {
                             ForEach(c.languages, id: \.self) { Text(languageName($0)).tag($0) }
                         }
                     }
-                    if c.overlay != nil { Toggle(c.overlayLabel ?? "Overlay files", isOn: $s.overlay) }
+                }
+                Section {
+                    HStack {
+                        Text("Replacement files")
+                        Spacer()
+                        Text(s.overlayPath.isEmpty ? "None" : (s.overlayPath as NSString).lastPathComponent).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Button("Choose…", action: chooseOverlay)
+                        if !s.overlayPath.isEmpty { Button("Remove") { s.overlayPath = "" } }
+                    }
+                    if !s.overlayPath.isEmpty { Toggle("Use them", isOn: $s.overlay) }
+                } footer: {
+                    Text(c.overlayLabel ?? "A folder laid out like the game's files (Content/…); its files replace the game's by path, e.g. assets from the PC version you own.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
@@ -163,6 +177,13 @@ struct LauncherView: View {
         }
         .padding(20)
         .frame(width: 460)
+    }
+
+    func chooseOverlay() {
+        let p = NSOpenPanel()
+        p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
+        p.message = "Choose a folder whose files replace the game's (laid out like its files: Content/…)"
+        if p.runModal() == .OK, let url = p.url { s.overlayPath = url.path; s.overlay = true }
     }
 
     func play() {

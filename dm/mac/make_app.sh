@@ -4,7 +4,8 @@
 # build folder and are found by absolute path (game.json), so moving the NSP folder needs the app packed again. Starting it shows the settings (resolution, frame rate,
 # sharpening, console mode, language, full screen, HUD) and Play starts the game in this app, so macOS turns Game Mode on in full screen.
 # usage: dm/mac/make_app.sh <title ID> <NSP folder> [overlay folder [overlay label]]
-#   the overlay folder (DM_ROMFS_OVERLAY) replaces game files by path, e.g. assets from the PC version the player owns; the launcher shows a switch for it
+#   the launcher lets the player choose a folder whose files replace the game's by path (DM_ROMFS_OVERLAY, e.g. assets from the PC version they own); an overlay folder given
+#   here is the preset choice and the label the note under it
 set -eu
 G=${1:?title ID}; NSP=$(cd "${2:?NSP folder}" && pwd); OVL=${3:-}; OVL_LABEL=${4:-}
 DM=$(cd "$(dirname "$0")/.." && pwd); B="$NSP/${G}_build"
