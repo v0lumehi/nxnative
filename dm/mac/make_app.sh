@@ -15,7 +15,7 @@ ROMFS="$B/extract/$PKG/RomFS"; MODS="$B/patched_$PKG"
 [ -d "$ROMFS" ] && [ -d "$MODS" ] || { echo "$B: run scripts/build_ipa_from_nsp.py on the NSP folder first (extracted files and rewritten modules are missing)"; exit 1; }
 if [ -d "$B/shader/vk" ]; then MSL="$B/shader"; else MSL="$B/shader/cache"; fi   # a Vulkan game's library, or the NVN shader cache
 [ -f "$B/font/nintendo_ext.ttf" ] || { mkdir -p "$B/font"; python3 "$DM/tools/make_ext_font.py" "$B/font/nintendo_ext.ttf" >/dev/null; }
-APP="$NSP/mac/$NAME.app"; C="$APP/Contents"
+APP="$NSP/mac/$(printf %s "$NAME" | sed 's/: / - /g; s/[:\/]/-/g').app"; C="$APP/Contents"   # a colon in the name is a slash in Finder
 rm -rf "$APP"; mkdir -p "$C/MacOS" "$C/Resources"
 L=$(mktemp); make -C "$DM/host" GAME="$G" dmhost >"$L" 2>&1 || { grep -E "error" "$L"; echo "building the host failed (log $L)"; exit 1; }; rm -f "$L"; cp "$DM/host/dmhost" "$C/MacOS/dmhost"
 swiftc -O -parse-as-library -target arm64-apple-macos14 "$DM/mac/Launcher.swift" -o "$C/MacOS/Launcher"
@@ -23,10 +23,12 @@ SHMAP=""; [ -f "$DM/games/$G/shader_map.tsv" ] && cp "$DM/games/$G/shader_map.ts
 LANGS=$(python3 "$DM/tools/nacp.py" --languages "$B/extract/$PKG/control.nacp" 2>/dev/null || true)
 python3 - "$C/Resources/game.json" <<EOF
 import json, sys
+sys.path.insert(0, """$DM/games"""); import settings
+fx = settings.fixups_keys(__import__('pathlib').Path("""$MODS""") / 'main.fixups.tsv')   # what main's rewriter stubs offer (patch_nso.py FS_KEYS)
 json.dump({"name": """$NAME""", "root": """$B""", "modules": """$MODS""", "romfs": """$ROMFS""", "msl": """$MSL""", "font": """$B/font""",
            "aoc": """$B/aoc""" if __import__('os').path.isdir("""$B/aoc""") else None, "shmap": """$SHMAP""" or None,
-           "fpsTarget": int("""$(gp fps_target 0)""" or 0), "fpsMax": int("""$(gp fps_max 60)""" or 60), "outputSize": bool("""$(gp output_size)"""),
-           "renderPool": int("""$(gp render_pool 0)""" or "0", 0) > 0, "docked": """$(gp op_mode docked)""" != "handheld",
+           "fpsTarget": int("""$(gp fps_target 0)""" or 0), "fpsMax": 240 if 'VAR_STEP' in fx else int("""$(gp fps_max 60)""" or 60),
+           "outputSize": 'OUTPUT_W' in fx and 'RENDER_POOL' not in fx, "renderPool": 'RENDER_POOL' in fx, "docked": """$(gp op_mode docked)""" != "handheld",
            "languages": """$LANGS""".split(), "overlay": """$OVL""" or None, "overlayLabel": """$OVL_LABEL""" or None}, open(sys.argv[1], "w"), indent=1)
 EOF
 ICON="$B/extract/$PKG/icon.jpg"; ICONKEY=""

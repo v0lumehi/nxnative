@@ -1,6 +1,6 @@
 // Mac launcher: the window a packed Mac app (dm/mac/make_app.sh) shows before the game starts, as the iOS launcher does (dm/ios/Sources/Launcher.swift). It reads the game's
 // paths and what its profile supports from Contents/Resources/game.json, keeps the choices in UserDefaults, sets the same environment switches as the scripts (DM_OUTPUT_SIZE /
-// DM_RENDER_SCALE, DM_FPS_TARGET with DM_PRESENT_HZ and DM_PRESENT_LINK, DM_PRESENT_SHARPEN, DM_OPMODE, DM_LANG, DM_FULLSCREEN, DM_METAL_HUD, DM_ROMFS_OVERLAY) and replaces itself
+// DM_RENDER_SCALE, DM_FPS_TARGET, DM_PRESENT_SHARPEN, DM_OPMODE, DM_LANG, DM_FULLSCREEN, DM_METAL_HUD, DM_ROMFS_OVERLAY) and replaces itself
 // with the host (execv), so the game runs as this app (its Game Mode and Dock icon). Variables already set in the environment are kept
 import AppKit
 import SwiftUI
@@ -15,9 +15,9 @@ struct GameConfig: Decodable {
     let aoc: String?
     let shmap: String?          // the profile's shader map, copied into the app
     let fpsTarget: Int          // the profile's fps_target (0 = no frame step)
-    let fpsMax: Int             // the profile's fps_max (above 60 = more frame rates)
-    let outputSize: Bool        // the profile has output_size: the whole frame at a chosen size
-    let renderPool: Bool        // the profile has render_pool: render scale above 1.0 (Breath of the Wild)
+    let fpsMax: Int             // the highest frame rate the game keeps its speed at: the profile's fps_max, 240 for a build with a variable frame step (VAR_STEP)
+    let outputSize: Bool        // the build has output size stubs (OUTPUT_W) and no render pool: the whole frame at a chosen size (Hades)
+    let renderPool: Bool        // the build grows its render buffer pool (RENDER_POOL): render scale above 1.0 (Breath of the Wild)
     let docked: Bool            // the profile's op_mode
     let languages: [String]
     let overlay: String?        // a preset replacement folder (DM_ROMFS_OVERLAY) until the player picks one in the launcher
@@ -81,7 +81,6 @@ final class Settings: ObservableObject {
         }
         if c.fpsTarget != 0 || c.fpsMax > 60 {
             e["DM_FPS_TARGET"] = String(fps)
-            if fps > 60 { e["DM_PRESENT_HZ"] = String(fps); e["DM_PRESENT_LINK"] = "2" }
         }
         if overlay && !overlayPath.isEmpty && FileManager.default.fileExists(atPath: overlayPath) { e["DM_ROMFS_OVERLAY"] = overlayPath }
         return e
