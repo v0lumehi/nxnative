@@ -94,6 +94,10 @@ static inline id rec_id(uint64_t v) { return (__bridge id)(void *)(uintptr_t)v; 
 static inline uint64_t rec_f(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static inline float rec_fv(uint64_t v) { uint32_t u = (uint32_t)v; float f; memcpy(&f, &u, 4); return f; }
 
+// Frame timeline (DM_NVN_TSV rows @ft_*, nvn_mtl.m): the frame a main command buffer belongs to is taken when it is recorded, and its commit time when the queue has it
+static uint64_t ft_frame(void);
+static void ft_commit_note(uint64_t frame);
+static _Atomic uint64_t g_rb_busy_ns;   // the encode thread's working time, taken per frame by mtl_enc_busy_ns_take
 // ---------- The encode thread ----------
 static id g_rx_cb, g_rx_enc;   // the encode thread's real command buffer and open encoder
 static void rec_exec(const rec_t *r) {
@@ -108,7 +112,7 @@ static void rec_exec(const rec_t *r) {
         pthread_mutex_lock(&g_res_mu);
         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
         pthread_mutex_unlock(&g_res_mu);
-        if (r->op == RO_COMMIT) g_rx_cb = nil;
+        if (r->op == RO_COMMIT) { g_rx_cb = nil; ft_commit_note(a[3]); }
         break; }
     case RO_SIGNAL: [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
     case RO_RE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb renderCommandEncoderWithDescriptor:rec_id(a[0])]; break;
@@ -168,7 +172,9 @@ static void *rec_thread(void *arg) {
         while (!g_rb_head) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
         rec_blk *b = g_rb_head; g_rb_head = b->next; if (!g_rb_head) g_rb_tail = NULL; g_rb_busy = 1;
         pthread_mutex_unlock(&g_rb_mu);
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         @autoreleasepool { for (int i = 0; i < b->n; i++) rec_exec(&b->r[i]); }
+        atomic_fetch_add_explicit(&g_rb_busy_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, memory_order_relaxed);
         pthread_mutex_lock(&g_rb_mu);
         b->n = 0; b->next = g_rb_free; g_rb_free = b; g_rb_busy = 0;
         if (!g_rb_head) pthread_cond_broadcast(&g_rb_idle);
@@ -289,10 +295,11 @@ static id rec_cb_new(void) { if (!rec_on()) return [g_dev newCommandBuffer]; rec
 static id rec_table(id t) { if (!rec_on() || !t) return t; DmRecTable *s = [DmRecTable new]; s->real = t; return s; }
 // The replay's main command buffer: committed once the uniform shadows queued so far are made (ubc_wait)
 static void rec_commit(id cb, MTL4CommitOptions *o) {
-    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); return; }
+    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); r->a[3] = ft_frame(); return; }
     ubc_wait(ubc_head());
     id<MTL4CommandBuffer> buffers[] = {cb};
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+    ft_commit_note(ft_frame());
 }
 // An upload batch: its place in the queue is after what is recorded so far (it reads no uniform shadow)
 static void rec_commit_upload(id cb, MTL4CommitOptions *o) {

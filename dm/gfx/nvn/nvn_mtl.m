@@ -1242,6 +1242,18 @@ static void gpu_capture_frame(uint64_t f) {
         else { MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String); g_cap_f0 = -1; }
     } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
 }
+// Frame timeline (DM_NVN_TSV @ft_* rows, hle_nvn.c): per frame the CPU times (mach ns) of its first and last main command buffer commit, the encode thread's working time, and per
+// present the time the present thread committed its display command buffer; all on the clock of GPUStartTime and presentedTime
+#define FTN 64
+static struct { _Atomic uint64_t f, c0, c1; } g_ftl[FTN];
+static uint64_t ft_frame(void) { return atomic_load(&g_cur_frame); }
+static void ft_commit_note(uint64_t f) {
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); unsigned k = f % FTN;
+    if (atomic_load(&g_ftl[k].f) != f) { atomic_store(&g_ftl[k].c0, t); atomic_store(&g_ftl[k].f, f); }
+    atomic_store(&g_ftl[k].c1, t);
+}
+int mtl_commit_span(uint64_t f, uint64_t *c0, uint64_t *c1) { unsigned k = f % FTN; if (atomic_load(&g_ftl[k].f) != f) return 0; *c0 = atomic_load(&g_ftl[k].c0); *c1 = atomic_load(&g_ftl[k].c1); return 1; }
+uint64_t mtl_enc_busy_ns_take(void) { return atomic_exchange(&g_rb_busy_ns, 0); }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
@@ -9005,6 +9017,8 @@ void ts_after(void) {
 #define PRING 1024
 typedef struct { uint64_t n; double t; } pres_ent;
 static pres_ent g_pres[PRING];
+static struct { _Atomic uint64_t n, t; } g_pcommit[PRING];   // present ticket -> when its display command buffer was committed (frame timeline)
+uint64_t mtl_present_commit_ns(uint64_t n) { return atomic_load(&g_pcommit[n % PRING].n) == n ? atomic_load(&g_pcommit[n % PRING].t) : 0; }
 // Get the actual presentation time of the nth present (returns 0 if not ready, -1 if dropped)
 double mtl_presented_time(uint64_t n) { pres_ent e = g_pres[n % PRING]; return e.n == n ? e.t : 0; }
 static _Atomic uint64_t g_drawable_ns;   // Accumulated wall clock waiting for nextDrawable in present (timing instrumentation)
@@ -9237,6 +9251,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
+    atomic_store(&g_pcommit[ticket % PRING].t, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); atomic_store(&g_pcommit[ticket % PRING].n, ticket);
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
