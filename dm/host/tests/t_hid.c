@@ -146,10 +146,38 @@ static void t_vibration(void) {
     CHECK(!h_hid_VibPermit(), "disconnecting the last output disables vibration");
 }
 
+// The control file (DM_CTL): stick holds that run out on their own while the reader goes on, a press's stick over a held one, and a file that a pusher replaced by a shorter copy
+static int16_t axis_of(int k) { return (int16_t)(atomic_load(&g_pad_axes[0]) >> (16 * k)); }
+static int wait_for(int (*cond)(void), double s) { for (int i = 0; i < (int)(s * 200); i++) { if (cond()) return 1; usleep(5000); } return 0; }
+static int c_lx_half(void) { return axis_of(0) == 16384 && axis_of(1) == -32767; }
+static int c_lx_free(void) { return axis_of(0) == 0 && axis_of(1) == 0; }
+static int c_rx_held(void) { return axis_of(2) == -32767 && axis_of(3) == 8192; }
+static int c_press_wins(void) { return (atomic_load(&g_pad_btn[0]) & DM_BTN_A) && axis_of(2) == 32767; }
+static int c_rx_back(void) { return !(atomic_load(&g_pad_btn[0]) & DM_BTN_A) && axis_of(2) == -32767; }
+static int c_restart(void) { return axis_of(0) == -32767; }
+static void put_file(const char *path, const char *txt, const char *mode) { FILE *f = fopen(path, mode); fputs(txt, f); fclose(f); }
+static void t_ctl(void) {
+    char path[512]; snprintf(path, sizeof path, "%s/t_hid_ctl_%d.txt", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
+    put_file(path, "# route\n", "w"); setenv("DM_CTL", path, 1); dm_pad_set(0, 0, 0, 0, 0); ctl_start();
+    put_file(path, "ls 0.5 -1 0.4\n", "a");
+    CHECK(wait_for(c_lx_half, 1), "ls x y seconds holds the left stick");
+    CHECK(wait_for(c_lx_free, 1), "the held left stick is released when its time is up");
+    put_file(path, "rs -1 0.25\n", "a");
+    CHECK(wait_for(c_rx_held, 1), "rs with no time holds the right stick");
+    put_file(path, "A+RRight~0.3\n", "a");
+    CHECK(wait_for(c_press_wins, 1), "a press's own stick name wins over the held stick while it lasts");
+    CHECK(wait_for(c_rx_back, 1), "after the press the held stick is back");
+    put_file(path, "rs 0 0\nls -1 0\n", "w");   // a new, shorter copy of the file: read from its start
+    CHECK(wait_for(c_restart, 1), "a control file that comes back shorter is read from its start");
+    put_file(path, "ls 0 0\n", "a"); CHECK(wait_for(c_lx_free, 1), "ls 0 0 releases");
+    unlink(path);
+}
+
 int main(void) {
     t_slots();
     t_npads();
     t_vibration();
+    t_ctl();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

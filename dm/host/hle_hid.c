@@ -115,7 +115,10 @@ void hid_keys_init(void) {
     pthread_t th; if (g_nsteps && !pthread_create(&th, NULL, keys_main, NULL)) { pthread_detach(th); LOG("DM_KEYS: %d steps", g_nsteps); }
 }
 
-// DM_CTL=<file> (Mac, for driving a game step by step from a shell): the host reads the lines appended to the file (polled every 100 ms) and acts on each at once:
+// DM_CTL=<file> (for driving a game step by step from a shell; a relative path is taken from the working directory, the app's Documents on iOS, where the Mac writes it with
+//   `xcrun devicectl device copy to`): the host reads the lines appended to the file (polled every 100 ms) and acts on each at once. A file that comes back shorter than what was
+//   read (replaced by a new copy, not appended to) is read again from its start, so a pusher that copies the whole file each time sends what it appended and one that starts a new
+//   file sends that one:
 //   "key[+key][~hold]" presses as a DM_KEYS step does (hold 0.15 s by default), "shot <path>" saves the next presented frame as a PNG (dm_gfx_shot_at), "passdump <n>" dumps the
 //   render passes of the next n frames as DM_NVN_PASSDUMP does (to stderr, the run's log), "texdump <path with %d>" saves the colour targets of the next frame as DM_NVN_TEXDUMP does,
 //   "env KEY=VALUE" sets a switch read at the time of use (DM_NVN_SNAPRAW for the next texdump), "cvarf <main offset> <value>" sets an Unreal float console variable
@@ -124,11 +127,35 @@ void hid_keys_init(void) {
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "#…" is ignored.
+//   Sticks and timing (scripted routes pushed as one file): "ls <x> <y> [seconds]" / "rs <x> <y> [seconds]" hold the left / right stick at x, y in -1..1 (up and right positive)
+//   for that long, or until the next ls / rs with no time (0 0 releases); they do not block the next line, so a press, a shot or the other stick can follow while the stick is
+//   held, and a press's own stick names (LLeft, RUp, …) win over a held stick while the press lasts. "wait <seconds>" and "waitframes <n>" (presented frames) hold the reading
+//   of the next line; "mark <text>" logs "DM_CTL: mark <text>" with the frame number, for cutting a run's log and per-frame rows at the route's steps.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+// Player 1's controller path as the control file drives it: the press in progress (buttons and the press's own stick names) over the held sticks, which run out on their own
+static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t btn; int32_t plx, ply, prx, pry, hl[2], hr[2]; double l_until, r_until; } g_ctl;   // until: CLOCK_MONOTONIC seconds, 0 = until changed
+static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void ctl_apply_locked(void) {
+    double now = mono_s();
+    if (g_ctl.l_until > 0 && now >= g_ctl.l_until) { g_ctl.hl[0] = g_ctl.hl[1] = 0; g_ctl.l_until = 0; }
+    if (g_ctl.r_until > 0 && now >= g_ctl.r_until) { g_ctl.hr[0] = g_ctl.hr[1] = 0; g_ctl.r_until = 0; }
+    dm_pad_set(g_ctl.btn, g_ctl.plx ? g_ctl.plx : g_ctl.hl[0], g_ctl.ply ? g_ctl.ply : g_ctl.hl[1], g_ctl.prx ? g_ctl.prx : g_ctl.hr[0], g_ctl.pry ? g_ctl.pry : g_ctl.hr[1]);
+}
+static void ctl_press(uint64_t btn, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
+    pthread_mutex_lock(&g_ctl_mu); g_ctl.btn = btn; g_ctl.plx = lx; g_ctl.ply = ly; g_ctl.prx = rx; g_ctl.pry = ry; ctl_apply_locked(); pthread_mutex_unlock(&g_ctl_mu);
+}
+static int32_t stick_axis(float v) { if (v > 1) v = 1; if (v < -1) v = -1; return (int32_t)lrintf(v * 32767.0f); }
+static void *ctl_stick_main(void *arg) {   // ends held sticks on time while the reader waits on a long press or a wait line
+    (void)arg;
+    for (;;) { pthread_mutex_lock(&g_ctl_mu); if (g_ctl.l_until > 0 || g_ctl.r_until > 0) ctl_apply_locked(); pthread_mutex_unlock(&g_ctl_mu); usleep(5000); }
+    return NULL;
+}
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
     for (;;) {
         FILE *f = fopen(path, "r");
+        if (f && !fseek(f, 0, SEEK_END) && ftell(f) < off) { LOG("DM_CTL: %s is shorter than the %ld bytes read; reading it from its start", path, off); off = 0; }
         if (f && !fseek(f, off, SEEK_SET)) {
             while (fgets(line, sizeof line, f)) {
                 size_t n = strlen(line); if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
@@ -145,6 +172,16 @@ static void *ctl_main(void *arg) {
                 if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1); } continue; }
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
+                if ((line[0] == 'l' || line[0] == 'r') && line[1] == 's' && line[2] == ' ') {   // ls / rs <x> <y> [seconds]
+                    float x = 0, y = 0, s = 0; if (sscanf(line + 3, "%f %f %f", &x, &y, &s) < 2) { LOG("[RED] DM_CTL %c%c wants x y [seconds]", line[0], line[1]); continue; }
+                    pthread_mutex_lock(&g_ctl_mu); int32_t *h = line[0] == 'l' ? g_ctl.hl : g_ctl.hr; h[0] = stick_axis(x); h[1] = stick_axis(y);
+                    *(line[0] == 'l' ? &g_ctl.l_until : &g_ctl.r_until) = s > 0 ? mono_s() + s : 0; ctl_apply_locked(); pthread_mutex_unlock(&g_ctl_mu);
+                    if (s > 0) LOG("DM_CTL: %s stick %.2f %.2f for %.2f s", line[0] == 'l' ? "left" : "right", x, y, s); else LOG("DM_CTL: %s stick %.2f %.2f until changed", line[0] == 'l' ? "left" : "right", x, y);
+                    continue;
+                }
+                if (!strncmp(line, "wait ", 5)) { double s = atof(line + 5); if (s > 0) usleep((useconds_t)(s * 1e6)); continue; }
+                if (!strncmp(line, "waitframes ", 11)) { uint64_t to = dm_guest_frame() + (uint64_t)atoll(line + 11); while (dm_guest_frame() < to) usleep(2000); continue; }
+                if (!strncmp(line, "mark ", 5)) { LOG("DM_CTL: mark %s (frame %llu)", line + 5, (unsigned long long)dm_guest_frame()); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
                     float x0, y0, x1, y1, s = 0.3f; if (sscanf(line + 5, "%f %f %f %f %f", &x0, &y0, &x1, &y1, &s) < 4) { LOG("[RED] DM_CTL drag wants x0 y0 x1 y1 [seconds]"); continue; }
                     int n = (int)(s / 0.008f); if (n < 2) n = 2;
@@ -156,7 +193,7 @@ static void *ctl_main(void *arg) {
                 parse_keys(line, &st);
                 LOG("DM_CTL: press %#llx (hold %.2f s)", (unsigned long long)st.btn, st.hold);
                 if (st.tap) { dm_touch t = {0, st.tx, st.ty}; dm_touch_set(&t, 1); }
-                dm_pad_set(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); dm_pad_set(0, 0, 0, 0, 0);
+                ctl_press(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); ctl_press(0, 0, 0, 0, 0);
                 if (st.tap) dm_touch_set(NULL, 0);
             }
         }
@@ -168,6 +205,7 @@ static void *ctl_main(void *arg) {
 static void ctl_start(void) {
     const char *e = getenv("DM_CTL"); if (!e || !*e) return;
     pthread_t th; if (!pthread_create(&th, NULL, ctl_main, strdup(e))) { pthread_detach(th); LOG("DM_CTL: reading key presses and screenshot requests from %s", e); }
+    if (!pthread_create(&th, NULL, ctl_stick_main, NULL)) pthread_detach(th);
 }
 
 static uint32_t connected_id(void) { return dm_opmode() == 0 ? NPAD_HANDHELD : NPAD_NO1; }
