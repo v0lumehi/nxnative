@@ -1212,6 +1212,9 @@ static void gpu_capture_frame(uint64_t f) {
         if (e && !strncmp(e, "gpu:", 4)) { gpu_thr = atof(e + 4); const char *c = strchr(e + 4, ':'); after = c ? atol(c + 1) : 0; g_cap_n = 1; g_cap_f0 = gpu_thr > 0 ? 0 : -1;
             if (gpu_thr > 0) MLOG("DM_GPU_CAPTURE: the first frame after frame %ld that follows 60 frames in a row with more than %.1f ms of GPU time is captured", after, gpu_thr); }
         else { g_cap_f0 = e ? atol(e) : -1; g_cap_n = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : 1; if (g_cap_n < 1) g_cap_n = 1; if (g_cap_f0 <= 0) g_cap_f0 = -1; } }
+    { static int swept; if (!swept++ && !getenv("DM_GPU_CAPTURE")) {   // GPU traces of earlier runs are 1.5–2 GB each: a run that does not capture removes those it finds in the working directory
+            NSArray *l = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@"." error:nil];
+            for (NSString *n in l) if ([n hasPrefix:@"dm_f"] && [n hasSuffix:@".gputrace"]) { [NSFileManager.defaultManager removeItemAtPath:n error:nil]; MLOG("DM_GPU_CAPTURE: removed %s from an earlier run", n.UTF8String); } } }
     if (g_cap_f0 < 0) return;
     // DM_GPU_CAPTURE=gpu:<ms>[:<after frame>]: a heavy scene, whenever it comes: 60 frames in a row past <ms> (one long frame in a light scene fired it in the first iPhone run)
     static int over; if (gpu_thr > 0 && !g_cap_on && f > 8 && (long)f >= after) { double g = mtl_gpu_ms(f - 8); over = g >= gpu_thr ? over + 1 : g >= 0 ? 0 : over; if (over >= 60) g_cap_f0 = (long)f; }
