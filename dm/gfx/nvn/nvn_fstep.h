@@ -43,6 +43,7 @@ typedef struct {
     int ckmin;                // the kmin run, crun and cref belong to
     uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
     int late_need;            // late frames in a row before a step up (0 = 3)
+    double late_slack;        // with late_need: vsyncs a frame may show longer than its hold before it is late (0 = FSTEP_LATE)
 } nvn_fstep;
 
 // Whether the cost at the longer hold is the cost that held kmin (a probe without a slowed report)
@@ -73,7 +74,10 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (s->k > kmax) s->k = kmax;
     s->kmin = kmin;
     int scr = s->screen; s->screen = 0;
-    int late = scr ? scr == 2 : shown > held + FSTEP_LATE + s->shown_slack || cost > held + FSTEP_LATE, grace = s->grace > 0;
+    // late_need set (DM_FSTEP_LATE): only what the screen shows counts, never the measured cost (on an iPhone the cost climbs while the clock ramps down, and stepping on it
+    // locked the run at 30 fps), and late_slack (DM_FSTEP_SLACK, vsyncs) replaces FSTEP_LATE as the margin
+    double margin = s->late_slack > 0 ? s->late_slack : FSTEP_LATE;
+    int late = scr ? scr == 2 : s->late_need > 0 ? shown > held + margin + s->shown_slack : shown > held + FSTEP_LATE + s->shown_slack || cost > held + FSTEP_LATE, grace = s->grace > 0;
     if (grace) s->grace--;
     if (late) { s->late++; s->late_run = grace ? 0 : s->late_run + 1; s->fit_run = 0; } else s->late_run = 0;
     // The cost of the frames on time (a hitch is not what the scene costs): at kmin, and at the longer hold
