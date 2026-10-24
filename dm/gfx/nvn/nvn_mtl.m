@@ -726,6 +726,7 @@ uint64_t mtl_cut_count(void);
 enum { GP_MAX = 4096 };   // the largest timestamp heap Metal makes
 typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; uint32_t ld_kb, st_kb; uint16_t cfmt, dfmt; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
 static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1, g_gp_every; static uint64_t g_gp_frame;
+static int g_cap_on;   // DM_GPU_CAPTURE is recording (defined with the capture code)
 static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
 static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
 static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
@@ -765,6 +766,11 @@ static void gp_end(id e) {   // right before that encoder ends
     if (g_gp_lab[k].kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment intoHeap:g_gp_heap atIndex:2 * k + 1];
     else [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:g_gp_heap atIndex:2 * k + 1];
 }
+int mtl_diag_frame(uint64_t f) {   // the frames a diagnostic slows on purpose: excluded from the frame step's lateness (hle_nvn.c)
+    if (g_gp_f0 >= 0 && ((g_gp_every > 0 && f % (uint64_t)g_gp_every <= 1) || (g_gp_every <= 0 && (long)f >= g_gp_f0 && (long)f <= g_gp_f1 + 1))) return 1;
+    if (g_cap_on) return 1;
+    return 0;
+}
 static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's last command buffer has completed
     NSData *r = [g_gp_heap resolveCounterRange:NSMakeRange(0, 2 * n)]; const uint64_t *t = r.bytes; if (!t) { free(lab); atomic_store(&g_gp_busy, 0); return; }
     double tick_ns = 1e9 / (double)[g_dev queryTimestampFrequency], tot[2] = {0}, span = 0; uint64_t t0 = 0, t1 = 0, ld = 0, st = 0; int np = 0;
@@ -775,7 +781,13 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
             MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u load %u KB store %u KB fmt %u/%u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg, l->ld_kb, l->st_kb, l->cfmt, l->dfmt); }
         else MLOG("[gpuprof] F%llu %4d %8.1f us compute / copy after pass %llu start %+.1f seg %u copies %u (uniform updates %u) dispatches %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, (a - t[0]) * tick_ns / 1e3, l->seg, l->draws, l->h, l->w); }
     span = (t1 - t0) * tick_ns / 1e3;
-    MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders (%d render passes, attachments load %.1f MB store %.1f MB), first start to last end %.2f ms", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, np, ld / 1024.0, st / 1024.0, span / 1e3);
+    // Clock proxy: the median time of the tiny passes (at most 64x64, at most 2 draws), fixed-cost work whose time follows the GPU clock and not the scene
+    double tiny[GP_MAX / 2]; int nt = 0;
+    for (int i = 0; i < n; i++) { uint64_t a = t[2 * i], b = t[2 * i + 1]; const gp_lab *l = &lab[i]; if (!a || !b || b < a || l->kind != 'R' || l->draws > 2 || (uint32_t)l->w * l->h > 64 * 64) continue; tiny[nt++] = (b - a) * tick_ns / 1e3; }
+    for (int i = 1; i < nt; i++) for (int j = i; j > 0 && tiny[j] < tiny[j - 1]; j--) { double x = tiny[j]; tiny[j] = tiny[j - 1]; tiny[j - 1] = x; }
+    int nvn_fstep_hold_now(void) __attribute__((weak)); int dm_thermal_now(void) __attribute__((weak));
+    MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders (%d render passes, attachments load %.1f MB store %.1f MB), first start to last end %.2f ms; clock proxy: tiny-pass median %.1f us over %d, hold %d, thermal %d", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, np, ld / 1024.0, st / 1024.0, span / 1e3,
+         nt ? tiny[nt / 2] : 0.0, nt, nvn_fstep_hold_now ? nvn_fstep_hold_now() : -1, dm_thermal_now ? dm_thermal_now() : -1);
     free(lab); atomic_store(&g_gp_busy, 0);
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
@@ -2464,7 +2476,7 @@ static int sw_mode(const char *name, int dflt) {
 static inline int sw_on(int m) { return sw_on_at(m, atomic_load_explicit(&g_ab_phase, memory_order_relaxed)); }
 static int dcu_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DC_UNWRITTEN", 0); return m; }
 static int dcc_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DC_COVERED", 0); return m; }
-static int dso_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DS_OMIT", 0); return m; }
+static int dso_mode(void) { static int m = -1; if (m < 0) m = sw_mode(getenv("DM_NVN_DS_LOOKAHEAD") && !getenv("DM_NVN_DS_OMIT") ? "DM_NVN_DS_LOOKAHEAD" : "DM_NVN_DS_OMIT", 0); return m; }   // DM_NVN_DS_LOOKAHEAD: the same switch under the name the review (nx-arch) gave it
 // Diagnostic DM_NVN_SKIP_INPASS_CS=1 (or ab): compute dispatches that come while a render pass is open are dropped, so they do not end it. The picture is wrong (GPU particles are not
 // simulated); it measures what the passes such dispatches split cost (Breath of the Wild's G-buffer: one split per particle emitter)
 static int skipcs_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_SKIP_INPASS_CS", 0); return m; }

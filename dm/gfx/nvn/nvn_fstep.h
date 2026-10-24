@@ -42,6 +42,7 @@ typedef struct {
     double ccur; int ck, cn;  // the cost of the frames on time at the longer hold ck (running mean) and their count
     int ckmin;                // the kmin run, crun and cref belong to
     uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
+    int late_need;            // late frames in a row before a step up (0 = 3)
 } nvn_fstep;
 
 // Whether the cost at the longer hold is the cost that held kmin (a probe without a slowed report)
@@ -85,7 +86,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (held != s->ck) { s->ck = held; s->cn = 0; }
         if (!late && fits) { s->ccur = s->cn ? s->ccur + (cost - s->ccur) / 8 : cost; s->cn++; }
     }
-    if (s->late_run >= 3 && s->k < kmax) {   // step up to the cost, at least one vsync
+    if (s->late_run >= (s->late_need > 0 ? s->late_need : 3) && s->k < kmax) {   // step up to the cost, at least one vsync (late_need: the caller's DM_FSTEP_LATE, default 3)
         int want = (int)ceil(cost - 0.05);
         if (want < s->k + 1) want = s->k + 1;
         if (want > kmax) want = kmax;
