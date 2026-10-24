@@ -101,6 +101,20 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 - 19,592 shaders: `Shader/*.sbfsha` (BNSH), the gsys / ksys resource packs in `Pack/Bootup_Graphics.pack` and the terrain pack in `Pack/TitleBG.pack`, particle effects in `Effect/*.sesetlist` (11,373 shaders, 101 compute), layouts (`.sblarc`) and 37 in `main`. All bind with Mario's texture handle layout; the full build had no failure and no unresolved binding.
 - `pack_ipa.py` packs its 16 GB IPA in 57 s (Info-ZIP took 2 min 50 s).
 
+### Pipelines on a cold start
+
+- `pso_pairs.tsv`: 3,012 shader pairs from agl's BAHS program variations (the agl / gsys / terrain resource packs), which `shader_pairs.tsv` does not hold. 109 of the 543 pairs drawn on entering Zora's Domain came from them; with the table all 543 are known. The prebuild (15,767 bases) takes 910 MB in 16 files, 187 s with 7 workers for the first 12,755 and 19 s for the 3,012 more; the files open in 2.2 s cold, 0.25 s from the file cache, and add about 850 MB of footprint.
+- Mac (M2 Max), the Zora's Domain save, Metal shader cache empty (a new bundle ID per run):
+
+| Start | Frame entering the area | Draws that waited, entering it |
+|---|---|---|
+| `DM_PSO_MTL4=0`, no `pso_user.tsv` | 990 ms, then 535 / 738 / 496 ms frames | 512 draws, 3,325 ms |
+| Hybrid, archive prebuilt from `shader_pairs.tsv`, no `pso_user.tsv` | 830 ms, no other frame over 250 ms | 102 draws, 650 ms |
+| Hybrid, archive prebuilt with `pso_pairs.tsv` too, no `pso_user.tsv` | 340 ms, no other frame over 150 ms | 50 draws, 20 ms (no pair without its pulling base) |
+| Hybrid, archive and `pso_user.tsv` of an earlier run | no frame over 100 ms | 17 draws, 4.6 ms |
+
+Every kind of cold start also shows the game's own 130–220 ms frames every 9–13 frames for a while after the load, with no pipeline work in them.
+
 ## Mac routes
 
 - From the title menu into the autosave: `DM_KEYS=f2500:A,f2800:A,f3100:A,f3400:A` (control at frame ~3900).
@@ -116,6 +130,7 @@ General host changes first needed here; each applies to every game:
 - **Spin waits that take a spin lock** (`patch_nso.py` "Spin waits", `dm_spin_wait`) and **yields that make progress** (`thr_yield`): [development.md, Power](../../../docs/development.md#power).
 - **`DT_RELR`** (`relr_apply`) and **halfword jump tables** (`half_count`): [Packed relative relocations (DT_RELR)](../../../docs/reference/rewriter.md#packed-relative-relocations-dt_relr), [Halfword jump table landing pads sized to the largest entry](../../../docs/reference/rewriter.md#halfword-jump-table-landing-pads-sized-to-the-largest-entry). **NVN calls on the big host stack** (`nvn_big_entry`): [NVN entry points on the big host stack](../../../docs/reference/nvn-objects.md#nvn-entry-points-on-the-big-host-stack).
 - **SDK 20 service calls** and **record sizes against `GetCommandMemoryUsed`** (`draw_rec`): [SDK 20 six-axis sensor and amiibo (`nfp`) calls](../../../docs/reference/services.md#sdk-20-six-axis-sensor-and-amiibo-nfp-calls), [Applet resource user ID, launch parameters and VR mode](../../../docs/reference/services.md#applet-resource-user-id-launch-parameters-and-vr-mode), [Shared font load request](../../../docs/reference/services.md#shared-font-load-request), [Model heaps sized by the host's command record sizes](../../../docs/reference/memory.md#model-heaps-sized-by-the-hosts-command-record-sizes). **SDK 20's audio renderer layout** (`render_once`): [SDK 20's `AudioRenderSystem` layout](../../../docs/reference/audio.md#sdk-20s-audiorendersystem-layout). **Running a 30 fps game at 60**: [sead's dynamic present interval, `ksys::VFR` and the host's frame step](../../../docs/reference/frame-rate.md#seads-dynamic-present-interval-ksysvfr-and-the-hosts-frame-step).
+- **Pipeline bases, hybrid pipelines and the prebuild** (`pso_build_ex`, `hybrid_get`, `pso_prebuild`): [development.md, Hybrid pipelines](../../../docs/development.md#hybrid-pipelines), [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs); measured under [Pipelines on a cold start](#pipelines-on-a-cold-start).
 - **Hitch dumps and guest thread names** (`DM_HITCH_DUMP`), **heap probes** (`DM_PROBE_HEAP*`), **autorelease leaks**: [05, Scripted input and thread scheduling](../../../docs/agents/05-debugging.md#scripted-input-and-thread-scheduling), [05, Memory growth](../../../docs/agents/05-debugging.md#memory-growth).
 
 ## Open
