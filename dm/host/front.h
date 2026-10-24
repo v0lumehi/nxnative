@@ -12,6 +12,10 @@ void front_screen_match(int fps);
 // The landscape aspect ratio (width / height) of the canvas a game with the profile key aspect any fills, 0 = not known (iOS front_ios.m: the screen; the Mac has none, loader.c's weak
 // default). Read by loader.c when the game starts, to size a wide output
 double front_screen_aspect(void);
+// Progress screen of the first-start prepare step (nvn_mtl.m warm_prepare: "Preparing shaders" while the pipelines of the prewarm lists are built before the game's first frame):
+// title and done of total shown over the game's view (a dark screen, the title, a bar and a count), updated on each call; title NULL hides it. Any thread; the front end switches to its main
+// thread and does not block. Nothing is shown without a window
+void front_progress(const char *title, long done, long total);
 #include <stdint.h>
 // Text input box (for the software keyboard swkbd): the main thread shows a native input box and the calling thread blocks until the user confirms / cancels.
 // All text is UTF-8; max_chars is the maximum character count (0 = unlimited, only a hint for the front end; truncation is done uniformly by the caller hle_swkbd.c in UTF-16 units).
