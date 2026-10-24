@@ -1552,6 +1552,7 @@ int nvn_var_fps(void) { return dm_fps_state && vstep_on() ? dm_fps_var_cap : 0; 
 static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
+int nvn_fstep_hold_now(void) { return atomic_load(&g_fs_k); }
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
 int nvn_game_fps(void) { int c = fps_step_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() - s >= 1000000000ull ? 30 : 60; }
 static void present_cfg(const win_t *o) {
@@ -1648,6 +1649,10 @@ static void fstep_tick(const win_t *o) {
         slow_bits = (uint16_t)(slow_bits << 1 | (shown > k + FSTEP_LATE));
         if (__builtin_popcount(slow_bits) >= 12) g_fs.screen = 2;
     }
+    // DM_FSTEP_LATE=<n>: late frames in a row before the hold steps up (default 3). An iPhone lowers its GPU clock as soon as frames are held two vsyncs, and the GPU time measured
+    // there no longer fits one vsync even where the scene does at full clock (the trap of the iPhone runs); a large n keeps hold 1 through short slow stretches
+    { static int ln = -1; if (ln < 0) { const char *e = getenv("DM_FSTEP_LATE"); ln = e ? atoi(e) : 0; if (ln > 0) LOG("[nvn] frame step: %d late frames in a row before a step up (DM_FSTEP_LATE)", ln); } g_fs.late_need = ln; }
+    if (mtl_diag_frame(g_frame)) g_fs.screen = 1;   // a frame a diagnostic slowed (GPU profile, pass dump, capture) is not evidence for a longer hold
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
