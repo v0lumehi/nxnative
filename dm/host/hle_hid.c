@@ -129,12 +129,13 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "#…" is ignored.
 //   Sticks and timing (scripted routes pushed as one file): "ls <x> <y> [seconds]" / "rs <x> <y> [seconds]" hold the left / right stick at x, y in -1..1 (up and right positive)
 //   for that long, or until the next ls / rs with no time (0 0 releases); they do not block the next line, so a press, a shot or the other stick can follow while the stick is
-//   held, and a press's own stick names (LLeft, RUp, …) win over a held stick while the press lasts. "wait <seconds>" and "waitframes <n>" (presented frames) hold the reading
-//   of the next line; "mark <text>" logs "DM_CTL: mark <text>" with the frame number, for cutting a run's log and per-frame rows at the route's steps.
+//   held, and a press's own stick names (LLeft, RUp, …) win over a held stick while the press lasts. "wait <seconds>", "waitframes <n>" (presented frames) and "waitdraws <draws>
+//   [frames = 30] [timeout = 600 s]" (that many frames in a row with at least that many draws: a scene is up, not a menu or a loading screen) hold the reading of the next line; "mark <text>" logs "DM_CTL: mark <text>" with the frame number, for cutting a run's log and per-frame rows at the route's steps.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 // Player 1's controller path as the control file drives it: the press in progress (buttons and the press's own stick names) over the held sticks, which run out on their own
 static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint64_t btn; int32_t plx, ply, prx, pry, hl[2], hr[2]; double l_until, r_until; } g_ctl;   // until: CLOCK_MONOTONIC seconds, 0 = until changed
+__attribute__((weak)) uint64_t dm_gfx_frame_draws(void) { return 0; }   // draws of the last presented frame (hle_nvn.c; none without the graphics layer)
 static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void ctl_apply_locked(void) {
     double now = mono_s();
@@ -181,6 +182,14 @@ static void *ctl_main(void *arg) {
                 }
                 if (!strncmp(line, "wait ", 5)) { double s = atof(line + 5); if (s > 0) usleep((useconds_t)(s * 1e6)); continue; }
                 if (!strncmp(line, "waitframes ", 11)) { uint64_t to = dm_guest_frame() + (uint64_t)atoll(line + 11); while (dm_guest_frame() < to) usleep(2000); continue; }
+                if (!strncmp(line, "waitdraws ", 10)) {   // waitdraws <draws> [frames in a row = 30] [timeout s = 600]: a scene, not a menu or a loading screen, is on screen
+                    long need = 0, run = 30; double to = 600; sscanf(line + 10, "%ld %ld %lf", &need, &run, &to);
+                    uint64_t last = dm_guest_frame(); long ok = 0; double t0 = mono_s();
+                    while (ok < run && mono_s() - t0 < to) { uint64_t fr = dm_guest_frame(); if (fr != last) { last = fr; ok = (long)dm_gfx_frame_draws() >= need ? ok + 1 : 0; } usleep(2000); }
+                    if (ok >= run) LOG("DM_CTL: waitdraws %ld: reached after %.1f s (frame %llu, %llu draws)", need, mono_s() - t0, (unsigned long long)last, (unsigned long long)dm_gfx_frame_draws());
+                    else LOG("[RED] DM_CTL: waitdraws %ld: timed out after %.1f s (frame %llu, %llu draws)", need, mono_s() - t0, (unsigned long long)last, (unsigned long long)dm_gfx_frame_draws());
+                    continue;
+                }
                 if (!strncmp(line, "mark ", 5)) { LOG("DM_CTL: mark %s (frame %llu)", line + 5, (unsigned long long)dm_guest_frame()); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
                     float x0, y0, x1, y1, s = 0.3f; if (sscanf(line + 5, "%f %f %f %f %f", &x0, &y0, &x1, &y1, &s) < 4) { LOG("[RED] DM_CTL drag wants x0 y0 x1 y1 [seconds]"); continue; }

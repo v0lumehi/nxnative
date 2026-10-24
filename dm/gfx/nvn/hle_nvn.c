@@ -1701,6 +1701,8 @@ static void vstep_tick(const win_t *o) {
     }
 }
 static void vstep_off(void) { if (dm_fps_var_cap) memset(dm_fps_state + 0x50, 0, 4); }   // the whole-vsync step holds (the game's own step, a prerendered movie)
+static _Atomic uint64_t g_frame_draws;
+uint64_t dm_gfx_frame_draws(void) { return atomic_load(&g_frame_draws); }   // the last presented frame's draws (DM_CTL waitdraws, hle_hid.c)
 __attribute__((weak)) _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP): when the last present was made; graphics unit tests have no hle_thread.c
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
@@ -1769,7 +1771,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             trow(f, "@ft_nsub", g_ft_nsub); trow(f, "@ft_sync_ms", atomic_exchange(&g_ft_sync_ns, 0) / 1e6); trow(f, "@ft_enc_ms", mtl_enc_busy_ns_take() / 1e6);
         }
         g_ft_acq = g_ft_sub0 = g_ft_sub1 = 0; g_ft_nsub = 0;
-        trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw));
+        trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw)); atomic_store(&g_frame_draws, dr - prev_draw);
         static uint64_t pl, pst, pf, pudc; uint64_t l, st, fu; mtl_bw(&l, &st, &fu);
         trow(f, "@rt_load_mb", (l - pl) / 1048576.0); trow(f, "@rt_store_mb", (st - pst) / 1048576.0); trow(f, "@pass_full_rw", (double)(fu - pf));
         uint64_t udc = mtl_udc_saved_bytes(); trow(f, "@unwritten_dc_mb", (udc - pudc) / 1048576.0);
