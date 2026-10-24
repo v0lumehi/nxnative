@@ -2562,6 +2562,13 @@ static int dso_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DS
 // simulated); it measures what the passes such dispatches split cost (Breath of the Wild's G-buffer: one split per particle emitter)
 static int skipcs_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_SKIP_INPASS_CS", 0); return m; }
 static uint64_t g_skipcs_n;
+// Diagnostics that split the cost of the G-buffer passes (render passes with four colour attachments or more and a depth attachment; the picture is wrong while they are on):
+//   DM_NVN_DIAG_FS: their draws take a constant fragment shader (what remains is vertex work, rasterization, depth and attachment traffic)
+//   DM_NVN_DIAG_SCISSOR: their draws are scissored to one pixel (what remains is vertex work and the cost of each draw)
+//   DM_NVN_DIAG_SKIP: their draws are dropped (what remains is the passes themselves)
+static int dgfs_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DIAG_FS", 0); return m; }
+static int dgsc_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DIAG_SCISSOR", 0); return m; }
+static int dgsk_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DIAG_SKIP", 0); return m; }
 static int g_px_dcu, g_px_dcc;   // the switches as the open pass began (the A/B phase can change while it is open)
 static uint64_t g_stat_ds_omit;
 static uint64_t g_dcu_bytes, g_dcc_bytes, g_dcu_n, g_dcc_n, g_dso_split;   // bytes not stored / not loaded by the two switches; passes DM_NVN_DS_OMIT had to split
@@ -2703,7 +2710,8 @@ static void rp_end(void) { if (g_enc) { AP_B;
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
-    sd_finish(); enc_r_end_pass(g_enc); g_gp_bw_l0 = g_bw_load; g_gp_bw_s0 = g_bw_store; zskip_commit_clears();   // the profile's per-pass ledger counts from the previous pass end, profiled or not g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+    sd_finish(); enc_r_end_pass(g_enc); g_gp_bw_l0 = g_bw_load; g_gp_bw_s0 = g_bw_store;   // the profile's per-pass ledger counts from the previous pass end, profiled or not
+    zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
 #ifdef NVN_RT_RANGE_TEST
@@ -5097,6 +5105,20 @@ static void pso_prebuild_bg(void) {   // after the prewarm, in the app without a
 }
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRenderPassDescriptor *unused);
 static id<MTLFunction> ms_fs_override(NvShader *fs);   // DM_NVN_MAGSCAN (defined before draw)
+static int rt_gbuf(void) { int n = 0; for (int i = 0; i < R.rt.n && i < 8; i++) n += R.rt.color[i] != NULL; return R.has_rt && n >= 4 && R.rt.depth; }   // a G-buffer pass (DM_NVN_DIAG_*)
+static id<MTLFunction> dg_fs_override(const pso_key *k) {   // DM_NVN_DIAG_FS: a constant fragment shader writing every colour attachment of the pass
+    if (!sw_on(dgfs_mode()) || !rt_gbuf()) return nil;
+    int n = 0; for (int i = 0; i < 8; i++) if (k->cfmt[i]) { if (mtl_fmt_uint((MTLPixelFormat)k->cfmt[i]) || pf_int_kind((MTLPixelFormat)k->cfmt[i])) return nil; n = i + 1; }
+    if (!n) return nil;
+    static id<MTLFunction> fn[8]; static dispatch_once_t once;
+    dispatch_once(&once, ^{ NSMutableString *src = [NSMutableString stringWithString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+        for (int c = 1; c <= 8; c++) { [src appendFormat:@"struct O%d {", c]; for (int j = 0; j < c; j++) [src appendFormat:@" float4 c%d [[color(%d)]];", j, j];
+            [src appendFormat:@" };\nfragment O%d dg%d() { O%d o;", c, c, c]; for (int j = 0; j < c; j++) [src appendFormat:@" o.c%d = float4(0.5);", j]; [src appendString:@" return o; }\n"]; }
+        NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&e];
+        for (int c = 1; c <= 8; c++) fn[c - 1] = [lib newFunctionWithName:[NSString stringWithFormat:@"dg%d", c]];
+        if (!lib) MLOG("[RED] DM_NVN_DIAG_FS: constant fragment shaders do not compile: %s", e.localizedDescription.UTF8String); });
+    return fn[n - 1];
+}
 static int pf_int_kind(MTLPixelFormat f);
 // A pipeline Metal refused: when a colour the fragment shader writes has an integer attachment, its output was most likely translated as float (a game without PC reflection has no output types,
 // Tears of the Kingdom's BC4 block encoder and Ultrahand mask were the first cases). Writes the facts row that declares the outputs, for the profile's shader_facts_manual.tsv (merged by shader_split.py)
@@ -5118,6 +5140,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     id<MTLFunction> ms_fn = ms_fs_override(fs); if (ms_fn) k.fsfn = (__bridge void *)ms_fn;   // DM_NVN_MAGSCAN phases 2 / 3
+    if (!ms_fn && !g_pso_lmap && fs) { ms_fn = dg_fs_override(&k); if (ms_fn) k.fsfn = (__bridge void *)ms_fn; }   // DM_NVN_DIAG_FS
     // DM_PSO_PULL_ALL=1 (diagnostic): every draw that has a pulling pipeline draws with it, never with the pipeline for its layout
     { static int all = -1; if (all < 0) { const char *ev = getenv("DM_PSO_PULL_ALL"); all = ev && !strcmp(ev, "1"); if (all) MLOG("DM_PSO_PULL_ALL=1: every draw with a pulling pipeline draws with it (diagnostic)"); }
       if (all && !g_pso_lmap && !ms_fn && hybrid_on()) { __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs); if (h) { g_pso_pull = 1; return h; } } }
@@ -7949,7 +7972,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
-    if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
+    if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only
+    if (!g_defer_replaying && !g_fz_checking && sw_on(dgsk_mode()) && rt_gbuf()) return;   // DM_NVN_DIAG_SKIP: transform feedback capture, or nothing (tf_draw)
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
@@ -8056,6 +8080,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
     }
     if (!(g_ed.ok & ED_SC) || memcmp(&g_ed.sc, &sc, sizeof sc)) { enc_r_scissor(en, sc); g_ed.sc = sc; g_ed.ok |= ED_SC; }
+    if (sw_on(dgsc_mode()) && rt_gbuf()) { enc_r_scissor(en, (MTLScissorRect){0, 0, 1, 1}); g_ed.ok &= ~ED_SC; }   // DM_NVN_DIAG_SCISSOR
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { PD("Z %llu draw skipped: both faces culled", g_stat_pass); return; }
     { int cu = S.poly.cull == NVN_FACE_FRONT ? MTLCullModeFront : S.poly.cull == NVN_FACE_BACK ? MTLCullModeBack : MTLCullModeNone;
       int wi = (S.poly.front == NVN_FRONT_FACE_CCW) != atomic_load_explicit(&g_origin_ll, memory_order_relaxed) ? MTLWindingCounterClockwise : MTLWindingClockwise;   // the y flip of lower-left mode reverses the winding
