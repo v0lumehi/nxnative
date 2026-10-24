@@ -113,6 +113,18 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 
 Every kind of cold start also shows the game's own 130–220 ms frames every 9–13 frames for a while after the load, with no pipeline work in them.
 
+- The prepare step with the seed list `pso_manifest.tsv` (1,789 lines: New Game to the Shrine of Resurrection, then a Zora's Domain save load). Mac (M2 Max), runs started at a 1-minute load average below 4: Metal cache empty (a new bundle ID per run), the prebuilt archive, that save loaded. Frames over 25 ms with new pipelines or shader library loads, in the 60 s after the last menu press:
+
+| Start | Before the first frame | Frames with pipelines / library loads |
+|---|---|---|
+| No list (the profile before its list) | – | 4 / 5 (75 libraries), 168 ms of that work, worst frame 128 ms |
+| The list, background prewarm (`DM_PSO_PREPARE=0`) | – (14.6 and 16.0 s on one worker, during boot) | 0 / 0 (two runs) |
+| The list, prepare step | 5.2 and 2.2 s on 12 workers, 3.3 s on 8 (872 bases compiled) | 0 / 0 (three runs) |
+| Second start (Metal cache and archive warm) | 0.08 s, no screen | 0 / 0 |
+| A player's list (5,783 lines with the manifest), warm | 0.23 s, no screen (2.7 s in the background) | 0 / 0 |
+
+On this Mac the background prewarm also ends before the save loads, so the step changes the first minute only where the prewarm is slower than the way into play: a slower device, fewer cores, a longer list, a player who skips through the title. Frames over 25 ms without pipeline work (20–71 per run) are the game's own and vary with the machine's other load.
+
 ## Mac routes
 
 - From the title menu into the autosave: `DM_KEYS=f2500:A,f2800:A,f3100:A,f3400:A` (control at frame ~3900).
@@ -128,7 +140,7 @@ General host changes first needed here; each applies to every game:
 - **Spin waits that take a spin lock** (`patch_nso.py` "Spin waits", `dm_spin_wait`) and **yields that make progress** (`thr_yield`): [development.md, Power](../../../docs/development.md#power).
 - **`DT_RELR`** (`relr_apply`) and **halfword jump tables** (`half_count`): [Packed relative relocations (DT_RELR)](../../../docs/reference/rewriter.md#packed-relative-relocations-dt_relr), [Halfword jump table landing pads sized to the largest entry](../../../docs/reference/rewriter.md#halfword-jump-table-landing-pads-sized-to-the-largest-entry). **NVN calls on the big host stack** (`nvn_big_entry`): [NVN entry points on the big host stack](../../../docs/reference/nvn-objects.md#nvn-entry-points-on-the-big-host-stack).
 - **SDK 20 service calls** and **record sizes against `GetCommandMemoryUsed`** (`draw_rec`): [SDK 20 six-axis sensor and amiibo (`nfp`) calls](../../../docs/reference/services.md#sdk-20-six-axis-sensor-and-amiibo-nfp-calls), [Applet resource user ID, launch parameters and VR mode](../../../docs/reference/services.md#applet-resource-user-id-launch-parameters-and-vr-mode), [Shared font load request](../../../docs/reference/services.md#shared-font-load-request), [Model heaps sized by the host's command record sizes](../../../docs/reference/memory.md#model-heaps-sized-by-the-hosts-command-record-sizes). **SDK 20's audio renderer layout** (`render_once`): [SDK 20's `AudioRenderSystem` layout](../../../docs/reference/audio.md#sdk-20s-audiorendersystem-layout). **Running a 30 fps game at 60**: [sead's dynamic present interval, `ksys::VFR` and the host's frame step](../../../docs/reference/frame-rate.md#seads-dynamic-present-interval-ksysvfr-and-the-hosts-frame-step).
-- **Pipeline bases, hybrid pipelines and the prebuild** (`pso_build_ex`, `hybrid_get`, `pso_prebuild`): [development.md, Hybrid pipelines](../../../docs/development.md#hybrid-pipelines), [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs); measured under [Pipelines on a cold start](#pipelines-on-a-cold-start).
+- **Pipeline bases, hybrid pipelines, the prebuild and the prepare step** (`pso_build_ex`, `hybrid_get`, `pso_prebuild`, `warm_prepare`): [development.md, Hybrid pipelines](../../../docs/development.md#hybrid-pipelines), [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs), [the prepare step](../../../docs/development.md#the-prepare-step); measured under [Pipelines on a cold start](#pipelines-on-a-cold-start).
 - **Hitch dumps and guest thread names** (`DM_HITCH_DUMP`), **heap probes** (`DM_PROBE_HEAP*`), **autorelease leaks**: [05, Scripted input and thread scheduling](../../../docs/agents/05-debugging.md#scripted-input-and-thread-scheduling), [05, Memory growth](../../../docs/agents/05-debugging.md#memory-growth).
 
 ## Open
