@@ -283,7 +283,8 @@ static void udc_selftest(void) {
 // M2 Max, on AC power and on battery, thermal pressure nominal), GPU time a frame 9 → 14 ms, 25-30 dropped frames out of 300. A thread of its own then keeps one small dispatch
 // (one threadgroup of 32 threads, about 0.5 ms) running on a queue of its own whenever none of the game's submissions is on the GPU: from the completion of the last one in
 // flight to the next commit, so it never adds to the GPU time of the game's own work, which the frame step reads; filling only 2 ms of each gap (90% busy) still let the clock fall.
-// It starts only when frames come late (mtl_gpu_fill_frame: a tenth of 120 presents over the frame period by a quarter) and stops after a hold without late frames, which doubles at
+// It starts only when frames come late (mtl_gpu_fill_frame: one in 20 of 120 presents over the frame period by a tenth, as the frame step counts late frames;
+// a quarter and one in 10 never started it in Breath of the Wild's Zora's Domain, which then ran at 444 MHz with 11% of its frames late) and stops after a hold without late frames, which doubles at
 // each new start (60 s up to 16 min), so a game that never comes late never pays for it. Paused for suspension (mtl_gpu_fill_pause) and when no submission came for 250 ms
 static _Atomic uint64_t g_fill_commit, g_fill_done;   // the game's submissions committed / completed on the GPU
 static _Atomic uint64_t g_fill_last;   // time of the last commit
@@ -331,24 +332,35 @@ static void *fill_main(void *arg) {
 static void fill_thread(void) { pthread_t th; if (!pthread_create(&th, NULL, fill_main, NULL)) pthread_detach(th); }
 static void fill_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, fill_thread); atomic_store(&g_fill_on, 1); fill_wake(); }
 // Once per present (hle_nvn.c), with the time since the previous present and the frame period the game is paced to
-void mtl_gpu_fill_frame(double shown_ms, double period_ms) {
-    int mode = fill_mode(); if (mode != 2) { if (mode == 1 && !atomic_load(&g_fill_on)) { fill_start(); MLOG("GPU filler: on from the start (DM_GPU_FILL=1)"); } return; }
-    static int n, late, starts; static uint64_t on_since, quiet_since; static double hold_s = 60;
-    n++; if (period_ms > 0 && shown_ms > period_ms * 1.25) late++;
+static void fill_window(int is_late) {   // 120 frames a window: two late windows in a row (one in 20 frames late in each) start the filler; a hold without late windows stops it
+    static int n, late, starts, run; static uint64_t on_since, quiet_since; static double hold_s = 60;
+    n++; late += is_late != 0;
     if (n < 120) return;
-    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int was_late = late * 10 >= n; n = late = 0;
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int was_late = late * 20 >= n; n = late = 0;
+    run = was_late ? run + 1 : 0;   // a load or a hitch makes one window late (Breath of the Wild's start did, and the filler then ran 66 s for nothing); a clock too low for the game's work keeps doing it
     if (was_late) {
         quiet_since = 0;
-        if (!atomic_load(&g_fill_on)) {
+        if (!atomic_load(&g_fill_on) && run >= 2) {
             if (starts++) hold_s = hold_s * 2 < 960 ? hold_s * 2 : 960;
             on_since = t; fill_start();
-            MLOG("GPU filler: on, frames came late (start %d; it stops after %.0f s without late frames; DM_GPU_FILL=0 turns it off)", starts, hold_s);
+            MLOG("GPU filler: on, frames came late%s (start %d; it stops after %.0f s without late frames; DM_GPU_FILL=0 turns it off)", mtl_snap_on() ? " on screen" : "", starts, hold_s);
         }
     } else if (atomic_load(&g_fill_on)) {
         if (!quiet_since) quiet_since = t;
         if (t - quiet_since > (uint64_t)(hold_s * 1e9)) { atomic_store(&g_fill_on, 0); MLOG("GPU filler: off after %.0f s without late frames (on for %.0f s)", hold_s, (t - on_since) / 1e9); }
     }
 }
+// Once per present (hle_nvn.c), with the time since the previous present and the frame period the game is paced to: late = over the period by a tenth, as the frame step counts it
+void mtl_gpu_fill_frame(double shown_ms, double period_ms) {
+    int mode = fill_mode(); if (mode != 2) { if (mode == 1 && !atomic_load(&g_fill_on)) { fill_start(); MLOG("GPU filler: on from the start (DM_GPU_FILL=1)"); } return; }
+    if (mtl_snap_on()) return;   // present snapshots: the screen decides (mtl_gpu_fill_screen)
+    fill_window(period_ms > 0 && shown_ms > period_ms * 1.1);
+}
+// With present snapshots (DM_PRESENT_SNAP) the game runs up to a frame ahead of the screen and a frame whose work runs long is absorbed, so a late present says nothing about the
+// clock; what counts is the screen (hle_nvn.c, 8 presents late): a frame shown longer than its hold by a quarter or dropped, or held above the step its cap allows (the frame step
+// stepped up because the screen missed). Single long frames no longer start it, so it does not flap on a title whose late frames come in bursts; a Mac whose GPU cannot do the
+// frame's work in a period at the clock macOS picks misses the screen for stretches, and the clock must rise
+void mtl_gpu_fill_screen(int late) { if (fill_mode() == 2 && mtl_snap_on()) fill_window(late); }
 // Suspension: no filler work may run (iOS forbids GPU work in the background); waits until its last dispatch has completed
 void mtl_gpu_fill_pause(int on) {
     atomic_store(&g_fill_pause, on != 0);
@@ -771,9 +783,15 @@ uint64_t mtl_cut_count(void);
 // encoder begins (before its first draw or dispatch) and when it ends (after its fragment stage); nothing is serialized beyond the barriers the replay already sets, so the frame runs
 // as usual. Printed as "[gpuprof]" lines (one per encoder, then the frame's sum by kind and size) once the frame's last command buffer completes
 enum { GP_MAX = 4096 };   // the largest timestamp heap Metal makes
-typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
+typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads, bar, nw, nr; uint32_t draws, seg, att; uint64_t pass; uint32_t wk[9], rk[32]; } gp_lab;   // bar: the pass began with a full barrier; att: a hash of its attachments' textures; wk / rk: storage keys written (attachments) and sampled (gp_key)   // seg: the command buffer (segment) of the submission it is in
 static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1; static uint64_t g_gp_frame;
-static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+static int g_gp_bar = 1; static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+static uint32_t gp_key(id<MTLTexture> t0) {   // the storage a texture lives in: its root texture, or the heap / buffer and offset it was made in
+    id<MTLTexture> t = t0; if (!t) return 0; while (t.parentTexture) t = t.parentTexture;
+    uintptr_t k = t.buffer ? (uintptr_t)(__bridge void *)t.buffer + t.bufferOffset : t.heap ? (uintptr_t)(__bridge void *)t.heap + t.heapOffset : (uintptr_t)(__bridge void *)t;
+    return (uint32_t)(k ^ (k >> 32)) | 1;
+}
+static void gp_read(void *tv);
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF"); g_gp_f0 = e ? atol(e) : -1; g_gp_f1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_gp_f0; if (g_gp_f0 < 0) return 0; }
@@ -785,15 +803,20 @@ static void gp_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right 
         g_gp_heap = [g_dev newCounterHeapWithDescriptor:hd error:&er]; if (!g_gp_heap) { MLOG("[RED] GPUPROF: no counter heap: %s", er.description.UTF8String); g_gp_f0 = -1; return; } }
     if (!g_gp_state) { g_gp_state = 1; g_gp_n = 0; g_gp_frame = atomic_load(&g_cur_frame); [g_gp_heap invalidateCounterRange:NSMakeRange(0, GP_MAX)]; }
     if (2 * g_gp_n + 2 > GP_MAX) return;
-    gp_lab l = {kind, 0, 0, 0, 0, 0, kind == 'R' ? (uint32_t)g_stat_draw : g_gp_copies, g_seg, g_stat_pass}; if (kind != 'R') { l.w = (uint16_t)g_gp_disp; l.h = (uint16_t)g_gp_ubd; }
-    if (d) { for (int i = 0; i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i]; if (!c.texture) continue;
-            l.nc++; l.w = (uint16_t)MAX(c.texture.width >> c.level, 1); l.h = (uint16_t)MAX(c.texture.height >> c.level, 1); l.loads += c.loadAction == MTLLoadActionLoad; }
+    gp_lab l = {.kind = kind, .bar = (uint8_t)g_gp_bar, .draws = kind == 'R' ? (uint32_t)g_stat_draw : g_gp_copies, .seg = g_seg, .pass = g_stat_pass}; g_gp_bar = 1; if (kind != 'R') { l.w = (uint16_t)g_gp_disp; l.h = (uint16_t)g_gp_ubd; }
+    if (d) { for (int i = 0; i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i]; if (!c.texture) continue; l.wk[l.nw++] = gp_key(c.texture);
+            l.nc++; l.att = l.att * 31 + (uint32_t)(((uintptr_t)(__bridge void *)c.texture >> 4) & 0xffff) + c.level; l.w = (uint16_t)MAX(c.texture.width >> c.level, 1); l.h = (uint16_t)MAX(c.texture.height >> c.level, 1); l.loads += c.loadAction == MTLLoadActionLoad; }
         MTLRenderPassDepthAttachmentDescriptor *z = d.depthAttachment;
-        if (z.texture) { l.depth = 1; l.w = (uint16_t)MAX(z.texture.width >> z.level, 1); l.h = (uint16_t)MAX(z.texture.height >> z.level, 1); l.loads += z.loadAction == MTLLoadActionLoad; } }
+        if (z.texture) { l.depth = 1; l.wk[l.nw++] = gp_key(z.texture); l.att = l.att * 31 + (uint32_t)(((uintptr_t)(__bridge void *)z.texture >> 4) & 0xffff) + z.level; l.w = (uint16_t)MAX(z.texture.width >> z.level, 1); l.h = (uint16_t)MAX(z.texture.height >> z.level, 1); l.loads += z.loadAction == MTLLoadActionLoad; } }
     g_gp_lab[g_gp_n] = l; g_gp_cur = g_gp_n;
     if (kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageVertex intoHeap:g_gp_heap atIndex:2 * g_gp_n];
     else [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:g_gp_heap atIndex:2 * g_gp_n];
     g_gp_n++;
+}
+static void gp_read(void *tv) {   // a texture a draw or dispatch of the current encoder samples (tex_fast_rid)
+    if (g_gp_cur < 0 || !tv) return; gp_lab *l = &g_gp_lab[g_gp_cur]; uint32_t k = gp_key((__bridge id<MTLTexture>)tv);
+    for (int i = 0; i < l->nr; i++) if (l->rk[i] == k) return;
+    if (l->nr < 32) l->rk[l->nr++] = k;
 }
 static void gp_end(id e) {   // right before that encoder ends
     if (g_gp_cur < 0) return;
@@ -807,7 +830,9 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
     for (int i = 0; i < n; i++) { uint64_t a = t[2 * i], b = t[2 * i + 1]; if (!a || !b || b < a) continue;
         double us = (b - a) * tick_ns / 1e3; const gp_lab *l = &lab[i]; tot[l->kind != 'R'] += us;
         if (!t0 || a < t0) t0 = a; if (b > t1) t1 = b;
-        if (l->kind == 'R') MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg);
+        { char wr[400]; int o = 0; o += snprintf(wr + o, sizeof wr - o, " W"); for (int j = 0; j < l->nw; j++) o += snprintf(wr + o, sizeof wr - o, " %08x", l->wk[j]);
+          o += snprintf(wr + o, sizeof wr - o, " R"); for (int j = 0; j < l->nr && o < (int)sizeof wr - 10; j++) o += snprintf(wr + o, sizeof wr - o, " %08x", l->rk[j]); MLOG("[gpuprof] F%llu %4d keys%s", (unsigned long long)frame, i, wr); }
+        if (l->kind == 'R') MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u barrier %u att %08x", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg, l->bar, l->att);
         else MLOG("[gpuprof] F%llu %4d %8.1f us compute / copy after pass %llu start %+.1f seg %u copies %u (uniform updates %u) dispatches %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, (a - t[0]) * tick_ns / 1e3, l->seg, l->draws, l->h, l->w); }
     span = (t1 - t0) * tick_ns / 1e3;
     MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders, first start to last end %.2f ms", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, span / 1e3);
@@ -815,7 +840,7 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d];
-    if (g_last_end_relaxed && !g_game_barrier) g_bar_skip++;
+    if (g_last_end_relaxed && !g_game_barrier) { g_bar_skip++; g_gp_bar = 0; }
     else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; g_bar_full++; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
@@ -1241,15 +1266,33 @@ void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_f
 // game's command buffers on the GPU timeline, segments included), its idle time between them, and the CPU-visible effects the commits carried
 static _Atomic uint64_t g_sp_busy_ns, g_sp_cbs, g_sp_eff[4], g_sp_gap_ns, g_sp_gaps;
 static double g_sp_last_end; static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;   // GPU end of the latest command buffer seen (gpu_tag_done)
-static void sp_gpu(double g0, double g1) {   // every command buffer of the game's queue, segments included: busy = their union on the GPU timeline, gaps = idle time between them
+// Gap detail: sizes (< 0.25, < 1, < 3, >= 3 ms), the gaps before a frame's first command buffer, and for Metal 4 submissions the part of each gap before the CPU committed the
+// next command buffer (the GPU waited for the game) and the part after it (launch latency)
+static uint64_t g_sp_hn[4], g_sp_hns[4], g_sp_bound_ns, g_sp_cpu_ns, g_sp_lat_ns; static uint64_t g_sp_last_f;
+static void sp_gpu(double g0, double g1, double tc, uint64_t f) {   // every command buffer of the game's queue, segments included: busy = their union on the GPU timeline, gaps = idle time between them
     if (!(g0 > 0 && g1 > g0)) return;
     pthread_mutex_lock(&g_sp_mu);
-    if (g_sp_last_end > 0 && g0 > g_sp_last_end) { atomic_fetch_add(&g_sp_gap_ns, (uint64_t)((g0 - g_sp_last_end) * 1e9)); atomic_fetch_add(&g_sp_gaps, 1); }
+    if (g_sp_last_end > 0 && g0 > g_sp_last_end) {
+        double d = g0 - g_sp_last_end; int b = d < 0.25e-3 ? 0 : d < 1e-3 ? 1 : d < 3e-3 ? 2 : 3;
+        g_sp_hn[b]++; g_sp_hns[b] += (uint64_t)(d * 1e9);
+        if (f && f != g_sp_last_f) g_sp_bound_ns += (uint64_t)(d * 1e9);
+        if (tc > 0) { double w = tc - g_sp_last_end; w = w < 0 ? 0 : w > d ? d : w; g_sp_cpu_ns += (uint64_t)(w * 1e9); g_sp_lat_ns += (uint64_t)((d - w) * 1e9); }
+        atomic_fetch_add(&g_sp_gap_ns, (uint64_t)(d * 1e9)); atomic_fetch_add(&g_sp_gaps, 1);
+    }
+    if (f) g_sp_last_f = f;
     double s0 = g0 > g_sp_last_end ? g0 : g_sp_last_end;
     if (g1 > s0) atomic_fetch_add(&g_sp_busy_ns, (uint64_t)((g1 - s0) * 1e9));
     if (g1 > g_sp_last_end) g_sp_last_end = g1;
     pthread_mutex_unlock(&g_sp_mu);
     atomic_fetch_add(&g_sp_cbs, 1);
+}
+void mtl_syncprof_gaps(char *out, size_t cap, double frames) {
+    pthread_mutex_lock(&g_sp_mu);
+    snprintf(out, cap, "; gaps < 0.25 / < 1 / < 3 / >= 3 ms: %.1f / %.1f / %.1f / %.1f a frame (%.2f / %.2f / %.2f / %.2f ms), before a frame's first %.2f ms, before the commit %.2f ms, after it %.2f ms",
+             g_sp_hn[0] / frames, g_sp_hn[1] / frames, g_sp_hn[2] / frames, g_sp_hn[3] / frames, g_sp_hns[0] / 1e6 / frames, g_sp_hns[1] / 1e6 / frames, g_sp_hns[2] / 1e6 / frames, g_sp_hns[3] / 1e6 / frames,
+             g_sp_bound_ns / 1e6 / frames, g_sp_cpu_ns / 1e6 / frames, g_sp_lat_ns / 1e6 / frames);
+    memset(g_sp_hn, 0, sizeof g_sp_hn); memset(g_sp_hns, 0, sizeof g_sp_hns); g_sp_bound_ns = g_sp_cpu_ns = g_sp_lat_ns = 0;
+    pthread_mutex_unlock(&g_sp_mu);
 }
 int mtl_syncprof(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SYNCPROF"); v = e && atoi(e) > 0; } return v; }
 void mtl_syncprof_take(uint64_t *busy_ns, uint64_t *cbs, uint64_t eff[4], uint64_t *gap_ns, uint64_t *gaps) {
@@ -1261,8 +1304,8 @@ static void gpu_tag_begin(uint64_t f) {
     if (atomic_load(&g_gpu[k].frame) != f) { atomic_store(&g_gpu[k].frame, f); atomic_store(&g_gpu[k].ns, 0); atomic_store(&g_gpu[k].pending, 0); atomic_store(&g_gpu[k].t0, UINT64_MAX); atomic_store(&g_gpu[k].t1, 0); }
     atomic_fetch_add(&g_gpu[k].pending, 1);
 }
-static void gpu_tag_done(uint64_t f, double g0, double g1) {
-    if (mtl_syncprof()) sp_gpu(g0, g1);
+static void gpu_tag_done_c(uint64_t f, double g0, double g1, double tc) {   // tc: CPU commit time (0 unknown)
+    if (mtl_syncprof()) sp_gpu(g0, g1, tc, f);
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f) return;
     double d = g1 - g0;
@@ -1274,6 +1317,7 @@ static void gpu_tag_done(uint64_t f, double g0, double g1) {
     }
     atomic_fetch_sub(&g_gpu[k].pending, 1);
 }
+static void gpu_tag_done(uint64_t f, double g0, double g1) { gpu_tag_done_c(f, g0, g1, 0); }
 static void gpu_tag_f(id<MTLCommandBuffer> cb, uint64_t f) { gpu_tag_begin(f); [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { gpu_tag_done(f, c.GPUStartTime, c.GPUEndTime); }]; }
 void gpu_tag(id<MTLCommandBuffer> cb) { gpu_tag_f(cb, atomic_load(&g_cur_frame)); }
 double mtl_gpu_ms(uint64_t f) {
@@ -1311,8 +1355,9 @@ uint64_t mtl_sub_commit(void) {
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
     NSString *cctx = @(cctx_snap());
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
+    double t_commit = mtl_syncprof() ? CACurrentMediaTime() : 0;   // feedback handlers run after this function, so the commit below is before them
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
-        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        gpu_tag_done_c(gpu_f, cb.GPUStartTime, cb.GPUEndTime, t_commit);
         if (atomic_fetch_add(&g_fill_done, 1) + 1 == atomic_load(&g_fill_commit) && atomic_load(&g_fill_on)) fill_wake();   // a gap begins
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
@@ -3603,7 +3648,12 @@ static id<MTLTexture> img_fit(int tid, id<MTLTexture> t, int dpf, uint64_t *rid)
     r->im = (void *)CFBridgingRetain(v); r->im_of = (__bridge void *)t; r->im_rid = v.gpuResourceID._impl;
     *rid = r->im_rid; return v;
 }
+static inline __attribute__((always_inline)) uint64_t tex_fast_rid_(int tid, void **out);
 static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void **out) {
+    if (__builtin_expect(g_gp_cur >= 0, 0)) { void *tv = NULL; uint64_t r = tex_fast_rid_(tid, &tv); gp_read(tv); if (out) *out = tv; return r; }
+    return tex_fast_rid_(tid, out);
+}
+static inline __attribute__((always_inline)) uint64_t tex_fast_rid_(int tid, void **out) {
     if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].view && g_treg[tid].view_ser == g_ser_gen && (!g_treg[tid].view_pkg || g_treg[tid].view_dirty == nvn_dirty_now())) { if (out) *out = g_treg[tid].view; return g_treg[tid].view_rid; }
     id<MTLTexture> t = tex_by_id(tid); if (out) *out = (__bridge void *)t; return t ? t.gpuResourceID._impl : 0;
 }
@@ -8519,6 +8569,19 @@ static uint64_t snap_take(const tex_t *t) {
     id<MTL4CommandBuffer> cb = g_snap_cb[k];
     [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    {   // Test switch DM_TEST_GPU_LOAD=<iterations>: extra GPU work at the end of every frame, ahead of the snapshot copy on the game's queue, that scales with the clock as rendering does:
+        // imitates a Mac with a smaller GPU (the frame's work no longer fits a period at the lowest clock). Not set in the product
+        static int it = -1; static id<MTLComputePipelineState> lps; static id<MTLBuffer> lbuf; static id<MTL4ArgumentTable> lat;
+        if (it < 0) { const char *e = getenv("DM_TEST_GPU_LOAD"); it = e ? atoi(e) : 0;
+            if (it > 0) { NSError *er = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void load(device uint *o [[buffer(0)]], uint t [[thread_position_in_grid]]) { uint n = o[1], x = t; for (uint i = 0; i < n; i++) x = x * 1664525u + 1013904223u; if (x == 0x9e3779b9u) o[0] = x; }" options:nil error:&er];
+                lps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"load"] error:&er] : nil;
+                lbuf = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; ((uint32_t *)lbuf.contents)[1] = (uint32_t)it;
+                MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; lat = [g_dev newArgumentTableWithDescriptor:ad error:&er];
+                if (!lps || !lat) { MLOG("[RED] DM_TEST_GPU_LOAD: no pipeline or argument table (%s)", er.description.UTF8String); it = 0; }
+                else { [g_snap_res addAllocation:lbuf]; [g_snap_res commit]; [lat setAddress:lbuf.gpuAddress atIndex:0]; MLOG("DM_TEST_GPU_LOAD: %d iterations on 32,768 threads at the end of every frame (test switch)", it); } } }
+        if (it > 0) { [ce setComputePipelineState:lps]; [ce setArgumentTable:lat]; [ce dispatchThreadgroups:MTLSizeMake(512, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionNone]; }
+    }
     [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     [ce endEncoding]; [cb endCommandBuffer];
     if (on_sub_thread()) rec_drain();   // after everything the encoding thread still holds of the frame (presents from the submitting thread)
@@ -8591,6 +8654,7 @@ void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = g_bw_load
 uint64_t mtl_udc_saved_bytes(void) { return g_udc_saved_bytes; }
 int mtl_has_window(void) { return front_metal_layer() != NULL; }
 int mtl_link_active(void) { return link_on(); }
+int mtl_link_stalled(void) { return __atomic_load_n(&g_stall_t0, __ATOMIC_RELAXED) != 0; }   // the display link has gone silent and mtl_present_wait drops frames (see STALL_NS) until it calls back
 void mtl_link_pause(int on) { CAMetalDisplayLink *l = g_link; if (l) l.paused = on != 0; }   // For testing (DM_TEST_BG): imitates the system stopping the display-link callback in the background
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     if (!mtl_link_active()) return 0;

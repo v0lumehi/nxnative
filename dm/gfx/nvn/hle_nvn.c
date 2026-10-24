@@ -649,12 +649,13 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     }
     return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
+static uint64_t g_sp_scr_n, g_sp_scr_miss, g_sp_scr_drop;   // on-screen intervals (present thread only)
 static void sp_report(uint64_t frames) {   // every 300 presents
     static uint64_t t_prev; uint64_t t = now_ns(); double wall = t_prev ? (t - t_prev) / 1e6 : 0; t_prev = t;
     if (!wall) return;
     void mtl_syncprof_take(uint64_t *, uint64_t *, uint64_t[4], uint64_t *, uint64_t *);
     uint64_t busy, cbs, eff[4], gap, gaps; mtl_syncprof_take(&busy, &cbs, eff, &gap, &gaps);
-    char line[1400]; int o = snprintf(line, sizeof line, "[nvn] syncprof up to frame %llu: %.1f ms a frame; GPU busy %.0f%% (%.2f ms a frame, %.1f command buffers), idle between them %.2f ms a frame (%.1f gaps); effects: events %llu, counters %llu, occlusion %llu; SyncWait calls %llu (signaled %llu, unfenced %llu); QueueFinish %llu (%.2f ms a frame); acquire: tick wait %.2f ms a frame, texture wait %.2f ms a frame (%llu frames over 0.5 ms); blocking waits:",
+    char line[2000]; int o = snprintf(line, sizeof line, "[nvn] syncprof up to frame %llu: %.1f ms a frame; GPU busy %.0f%% (%.2f ms a frame, %.1f command buffers), idle between them %.2f ms a frame (%.1f gaps); effects: events %llu, counters %llu, occlusion %llu; SyncWait calls %llu (signaled %llu, unfenced %llu); QueueFinish %llu (%.2f ms a frame); acquire: tick wait %.2f ms a frame, texture wait %.2f ms a frame (%llu frames over 0.5 ms); blocking waits:",
                      (unsigned long long)frames, wall / 300, 100.0 * busy / 1e6 / wall, busy / 1e6 / 300, cbs / 300.0, gap / 1e6 / 300, gaps / 300.0, (unsigned long long)eff[1], (unsigned long long)eff[2], (unsigned long long)eff[3],
                      (unsigned long long)atomic_exchange(&g_sp_calls, 0), (unsigned long long)atomic_exchange(&g_sp_signaled, 0), (unsigned long long)atomic_exchange(&g_sp_unfenced, 0),
                      (unsigned long long)atomic_exchange(&g_sp_finish, 0), atomic_exchange(&g_sp_finish_ns, 0) / 1e6 / 300,
@@ -665,6 +666,8 @@ static void sp_report(uint64_t frames) {   // every 300 presents
                                 (unsigned long long)h->lag[0], (unsigned long long)h->lag[1], (unsigned long long)h->lag[2], h->timeouts ? ", timeouts" : "");
         h->n = h->ns = h->timeouts = 0; memset(h->lag, 0, sizeof h->lag); }
     pthread_mutex_unlock(&g_sp_mu);
+    void mtl_syncprof_gaps(char *, size_t, double); if (o < (int)sizeof line) mtl_syncprof_gaps(line + o, sizeof line - o, 300);
+    { size_t l = strlen(line); snprintf(line + l, sizeof line - l, "; on screen: %llu of %llu frames shown longer than their period by a quarter, %llu dropped", (unsigned long long)g_sp_scr_miss, (unsigned long long)g_sp_scr_n, (unsigned long long)g_sp_scr_drop); g_sp_scr_n = g_sp_scr_miss = g_sp_scr_drop = 0; }
     LOG("%s", line);
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -1278,11 +1281,14 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
         rt_comp_tick(rtp);
         uint64_t p0 = now_ns();
-        static int ahead = -1; if (ahead < 0) { const char *e = getenv("DM_PACE_AHEAD"); int mtl_snap_on(void); ahead = (e && atoi(e) > 0) || mtl_snap_on(); if (ahead) LOG("[nvn] a frame starts as soon as its swapchain texture is free, not on the next display link tick (DM_PACE_AHEAD / DM_PRESENT_SNAP)"); }
-        if (ahead && mtl_link_active()) { uint64_t mtl_snap_take_wait(void); pace_ns += mtl_snap_take_wait(); }   // the texture's previous present (or the snapshot ring, nvn_mtl.m) holds the game at most a frame or two ahead of the screen; its wait is pacing, not the frame's cost
+        int snap = mtl_snap_on();
+        if (snap && mtl_link_active()) { if (wait && mtl_link_stalled()) sleep_until_ns(at); }   // present snapshots (nvn_mtl.m): the frame starts at once, and the presenting
+            // thread's wait for a free ring slot paces it. While the display link is silent (the window in the background or covered) frames are dropped as fast as they come and
+            // nothing frees a slot later, so the texture's slot time paces the game as without snapshots: unpaced, Breath of the Wild ran 3 to 4.5 times real time there
         else if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
         pace_ns = now_ns() - p0;
+        if (snap) pace_ns += mtl_snap_take_wait();   // that wait is pacing too, so the frame step does not count it as the frame's cost
     } else {   // DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
         static int pace = -1; static uint64_t step, last;
@@ -1293,9 +1299,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     { extern _Atomic uint64_t g_sp_pace_ns; atomic_fetch_add(&g_sp_pace_ns, pace_ns); }
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; extern _Atomic uint64_t g_sp_ticket_ns, g_sp_ticket_n; uint64_t d = now_ns() - w0; atomic_fetch_add(&g_sp_ticket_ns, d); if (d > 500000) atomic_fetch_add(&g_sp_ticket_n, 1);
-        static int ahead_ = -1; if (ahead_ < 0) { const char *e = getenv("DM_PACE_AHEAD"); ahead_ = e && atoi(e) > 0; }
-        if (ahead_) pace_ns += d; }   // DM_PACE_AHEAD: the texture wait paces the frame, so the frame step does not count it as the frame's CPU cost
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; extern _Atomic uint64_t g_sp_ticket_ns, g_sp_ticket_n; uint64_t d = now_ns() - w0; atomic_fetch_add(&g_sp_ticket_ns, d); if (d > 500000) atomic_fetch_add(&g_sp_ticket_n, 1); }
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
@@ -1628,6 +1632,19 @@ static void fstep_tick(const win_t *o) {
     // refresh more than its hold: a cheap 50 ms frame shows 54.5 ms at 165 Hz, which counted as late kept the hold at 20 fps for good
     int hz = front_screen_max_fps(); g_fs.shown_slack = hz > 60 && hz % 60 && mtl_link_active() ? 60.0 / hz : 0;
     int cslow = fstep_cpu_slowed(o->presents), gslow = nvn_fstep_gpu_slowed(&g_fg, gpu, k0 ? k0 : kmin, kmin, probe0) && dm_thermal_now() <= 1 && !dm_low_power_now();   // same gates as the CPU's
+    // Present snapshots (nvn_mtl.m snap_take): the game runs up to a frame ahead of the screen, so a frame whose work runs long is absorbed instead of shown late, and its cost is
+    // no evidence against the hold (Breath of the Wild in Zora's Domain stepped to 30 at a GPU time of 0.75 vsyncs: the frame's CPU time held its waits on its own GPU work).
+    // Lateness is then what the screen shows: the on-screen interval of the frame 8 presents back against its hold (pres_expect_ms), late by a quarter or dropped
+    // A game that is slower than its hold frame after frame (not a few long frames: 12 of the last 16 started late) is late too, though the screen misses only every few frames:
+    // 18.9 ms frames at hold 1 missed one refresh in 7, never three in a row, and ran at a jittering 53 fps with a payback every few frames instead of a steady 30
+    if (mtl_snap_on() && mtl_link_active() && !mtl_link_stalled() && o->presents > 9) {   // (frames the stall fallback drops say nothing about the game: judged by cost then)
+        uint64_t pn = o->presents - 8; double a = mtl_presented_time(pn), b = mtl_presented_time(pn - 1);
+        if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
+        static uint16_t slow_bits; static int slow_k; int k = g_fs.k ? g_fs.k : kmin;
+        if (k != slow_k) { slow_k = k; slow_bits = 0; }   // judged against the hold in force, not the frames before a step
+        slow_bits = (uint16_t)(slow_bits << 1 | (shown > k + FSTEP_LATE));
+        if (__builtin_popcount(slow_bits) >= 12) g_fs.screen = 2;
+    }
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
@@ -1777,7 +1794,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (a_ < 0) trow(f - 8, "@presented_ms", -1); else if (a_ > 0 && b_ > 0) trow(f - 8, "@presented_ms", (a_ - b_) * 1e3);
         g_pres_exp[g_presn % TWIN] = g_pres_exp_last = pres_expect_ms(n);
         g_pres_iv[g_presn++ % TWIN] = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0);
-        { double iv_ = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0); mtl_ub_present(iv_); }   // same-process alternating measurement (DM_NVN_UB) tallies on-screen present intervals per phase; when off it is just one atomic read
+        { double iv_ = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0); mtl_ub_present(iv_); }
+        if (mtl_syncprof() && period && b_ > 0) { if (a_ < 0) g_sp_scr_drop++; else if (a_ > 0) { g_sp_scr_n++; if ((a_ - b_) * 1e9 > period * 1.25) g_sp_scr_miss++; } }   // syncprof: frames that stayed on screen longer than their period by a quarter   // same-process alternating measurement (DM_NVN_UB) tallies on-screen present intervals per phase; when off it is just one atomic read
+        if (mtl_snap_on() && (a_ < 0 || (a_ > 0 && b_ > 0))) {   // the GPU filler with present snapshots judges by the screen (nvn_mtl.m mtl_gpu_fill_screen)
+            int kmin = fstep_on() ? 60 / fps_step_cap() : 0, held = g_hold_ring[n % 16];
+            void mtl_gpu_fill_screen(int); mtl_gpu_fill_screen(a_ < 0 || (a_ - b_) * 1e3 > 1.25 * pres_expect_ms(n) || (kmin && held > kmin));
+        }
         dm_perf_present(a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0));   // on-screen present intervals are also kept in a separate ring; tsummary reports dropped frames every 300 frames (M1 criterion)
         if (a_ > 0) trow(f - 8, "@pres_at_ms", a_ * 1e3 - g_t0_ns / 1e6); }   // on-screen present time (ms since process start; presentedTime shares a time base with mach_absolute_time)
     if (f >= 8 && slow_on()) slow_emit(f - 8);
