@@ -1637,7 +1637,8 @@ static void fstep_tick(const win_t *o) {
     }
     // DM_FSTEP_LATE=<n>: late frames in a row before the hold steps up (default 3). An iPhone lowers its GPU clock as soon as frames are held two vsyncs, and the GPU time measured
     // there no longer fits one vsync even where the scene does at full clock (the trap of the iPhone runs); a large n keeps hold 1 through short slow stretches
-    { static int ln = -1; if (ln < 0) { const char *e = getenv("DM_FSTEP_LATE"); ln = e ? atoi(e) : 0; if (ln > 0) LOG("[nvn] frame step: %d late frames in a row before a step up (DM_FSTEP_LATE)", ln); } g_fs.late_need = ln; }
+    { static int ln = -1; if (ln < 0) { const char *e = getenv("DM_FSTEP_LATE"); ln = e ? atoi(e) : 0; if (ln > 0) LOG("[nvn] frame step: %d late frames in a row before a step up, judged by what the screen shows only (DM_FSTEP_LATE)", ln); } g_fs.late_need = ln;
+      static double sl = -1; if (sl < 0) { const char *e = getenv("DM_FSTEP_SLACK"); sl = e ? atof(e) : 0; if (sl > 0) LOG("[nvn] frame step: a frame is late only %.2f vsyncs past its hold, as the screen shows it (DM_FSTEP_SLACK)", sl); } g_fs.late_slack = sl; }
     if (mtl_diag_frame(g_frame)) g_fs.screen = 1;   // a frame a diagnostic slowed (GPU profile, pass dump, capture) is not evidence for a longer hold
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
@@ -1652,7 +1653,7 @@ static void fstep_tick(const win_t *o) {
         if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
         LOG("[nvn] frame step: hold %d → %d vsyncs at present %llu (%s; cost %.2f vsyncs, GPU %.2f%s)%s", k0, g_fs.k, (unsigned long long)o->presents,
-            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
+            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? (g_fs.late_need > 0 ? "DM_FSTEP_LATE late frames on screen" : "3 late frames") : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
     }
     if (probe0 == 1 && g_fs.probe != 1 && !fixed && nlog < 40)   // whether the controller raised the clock for the shorter deadline
         LOG("[nvn] frame step: the probe %s at present %llu (CPU %d%% on performance cores)%s", g_fs.probe == 2 ? "held" : "failed", (unsigned long long)o->presents, g_fs_pshare, ++nlog == 40 ? "; further changes only counted below" : "");
