@@ -1441,6 +1441,13 @@ def mac_run(py, repo, work, game, patched, msl, aoc, gfx, lang, env, logs, g, en
     if gfx == 'nvn': renv['DM_NVN_SHMAP'] = g.table('shader_map.tsv')
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
     if env_file: renv.update(env_file_pairs(env_file))
+    if gfx == 'nvn' and g.table('shader_pairs.tsv').is_file():
+        # The pipeline prebuild (docs/development.md, Hybrid pipelines): the pulling base of every shader pair into run/pso_archive, so the first run's draws have stand-ins instead
+        # of waiting for the Metal compiler. The host's tool mode skips it when pso_archive/prebuilt.tsv matches (chain version, depth mode, pair list): Breath of the Wild's
+        # 12,755 pairs took about 3 minutes on an M2 Max the first time. It assumes the GL depth mode; a game that sets near=0 builds its bases again in the background in the app
+        PROG.set(step='pipeline prebuild')
+        penv = dict(env, **{k: str(v) for k, v in renv.items()}, DM_PSO_PREBUILD='tool')
+        run([host], logs / 'pso_prebuild.log', env=penv, cwd=rd)
     PROG.end(str(host))
     q = lambda v: shlex.quote(str(v))
     return f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' {q(host)} {q(patched)}'
