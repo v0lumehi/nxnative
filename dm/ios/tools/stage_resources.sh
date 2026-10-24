@@ -13,6 +13,7 @@ case "$APP" in /*.app) ;; *) die "Unexpected app resource destination: $APP";; e
 [ -e "$DM_RESOURCE_ROMFS/$DM_RESOURCE_MARKER" ] || die "Game files unavailable: $DM_RESOURCE_ROMFS/$DM_RESOURCE_MARKER"
 [ -d "$DM_RESOURCE_SHADERS" ] || die "Shader libraries unavailable: $DM_RESOURCE_SHADERS"
 [ -z "$DM_RESOURCE_AOC" ] || [ -d "$DM_RESOURCE_AOC" ] || die "Add-on content unavailable: $DM_RESOURCE_AOC"
+[ -z "${DM_RESOURCE_ROMFS_OVERLAY:-}" ] || [ -d "$DM_RESOURCE_ROMFS_OVERLAY" ] || die "RomFS overlay unavailable: $DM_RESOURCE_ROMFS_OVERLAY"
 # The host is compiled from the repository's current sources and loads only msl/b-<its chain version>: after a chain change (a pull, dmsh_chain.py --header) the prepared shaders are another chain's
 case "$DM_RESOURCE_MSLDIR" in b-*)
     [ -f "$DM_RESOURCE_CHAIN_H" ] || die "No chain version header: $DM_RESOURCE_CHAIN_H (a project prepared before the chain version moved to dm/gfx/nvn: prepare the game again, build_ipa_from_nsp.py --prepare-xcode)"
@@ -22,6 +23,7 @@ esac
 echo 'Copy game resources (the first build copies the complete game; later builds sync changes)'
 mkdir -p "$APP/romfs" "$APP/msl/$DM_RESOURCE_MSLDIR"
 /usr/bin/rsync -a --delete -- "$DM_RESOURCE_ROMFS/" "$APP/romfs/"
+[ -z "${DM_RESOURCE_ROMFS_OVERLAY:-}" ] || /usr/bin/rsync -a -- "$DM_RESOURCE_ROMFS_OVERLAY/" "$APP/romfs/"   # the game profile's overlay over it
 /usr/bin/rsync -a --delete -- "$DM_RESOURCE_SHADERS/" "$APP/msl/$DM_RESOURCE_MSLDIR/"
 for old in "$APP/msl/"*; do
     [ "$old" = "$APP/msl/$DM_RESOURCE_MSLDIR" ] || rm -rf "$old"

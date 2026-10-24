@@ -6,6 +6,7 @@
 # Usage: dm/ios/tools/build_ipa.sh [output.ipa | --prepare-xcode]; --prepare-xcode generates the project without building, signing or packing.
 #   Environment: GAME=game profile (dm/games/<base game title ID>, or one in DM_GAMES_DIR; required), W=the game's work folder (required: <NSP folder>/<title ID>-work, never the home folder), PATCHED / ROMFS / MSL_IOS can each be overridden
 #   AOC=add-on content directory (default $W/data/aoc; when it exists it goes to DmIOS.app/aoc/<index>/; an empty string = none), GFXAPI=nvn / vulkan (default: by the shader libraries in MSL_IOS)
+#   ROMFS_OVERLAY=a folder of RomFS files that replace or add to the RomFS's (the game profile's romfs_overlay.py, written by the NSP script; none by default)
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the app version is the display version in the packed game's control data (the one next to the RomFS:
 #   nx_extract saves the update's there when an update is packed, else the base game's), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_APP_VERSION / DM_BUNDLE_ID override them);
 #   DM_SHOW_FPS=1 turns the frame-rate counter on (DMShowFPS in Info.plist; DM_SHOW_FPS in the app's Documents/env.txt overrides it on the phone);
@@ -133,6 +134,11 @@ rm -rf "$APP/msl" "$O/Payload" "$O/out.ipa"   # (the last two: what the copy-and
 P=Payload/DmIOS.app; MAPS=("$P=$APP" "$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR")
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 MAPS+=("$P/romfs=$ROMFS")
+if [ -n "${ROMFS_OVERLAY:-}" ]; then   # each file of the overlay in place of the RomFS's own, or added (pack_ipa.py: a mapping of its own leaves the walk's file out)
+  [ -d "$ROMFS_OVERLAY" ] || die "no RomFS overlay at $ROMFS_OVERLAY"
+  while IFS= read -r f; do MAPS+=("$P/romfs/$f=$ROMFS_OVERLAY/$f"); done < <(cd "$ROMFS_OVERLAY" && find . -type f ! -name .DS_Store | sed 's|^\./||' | sort)
+  t "RomFS overlay: $(find "$ROMFS_OVERLAY" -type f ! -name .DS_Store | wc -l | tr -d ' ') files from $ROMFS_OVERLAY"
+fi
 t "pack IPA (already-compressed game files stored, everything else deflated)"
 python3 tools/pack_ipa.py "$OUT_IPA" --store "$(gp zip_store)" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs "${MAPS[@]}" || die "pack_ipa"
 t "done: $OUT_IPA ($(du -h "$OUT_IPA" | cut -f1))"

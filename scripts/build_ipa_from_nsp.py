@@ -1419,7 +1419,7 @@ def env_file_pairs(path):   # an environment file's switches (one KEY=VALUE per 
     return out
 
 
-def mac_run(py, repo, work, game, patched, msl, aoc, gfx, lang, env, logs, g, env_file=''):
+def mac_run(py, repo, work, game, patched, msl, aoc, gfx, lang, env, logs, g, env_file='', overlay=None):
     """The last stage of a Mac-only build (PLATFORM 'mac'): the Mac host for the profile (build_mac_host, into <id>_build/tools/dmhost, where the run-time captures build it too; DM_GAMES_DIR /
     DM_GAMES_FIRST in env pick a provisional or derived profile) and the button-icon font the host gives a game for the Nintendo extension shared font (make_ext_font.py, into <id>_build/font,
     made again when the tool changed). Returns the command that runs the game in a window with sound (docs/development.md, Build by hand (Mac), step 5): its save and temporary storage in
@@ -1438,12 +1438,25 @@ def mac_run(py, repo, work, game, patched, msl, aoc, gfx, lang, env, logs, g, en
     for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
     renv = {'DM_ROOT': work, 'DM_ROMFS': game / 'RomFS', 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_MSL_DIR': msl, 'DM_FONT_DIR': font}
     if aoc: renv['DM_AOC_DIR'] = aoc
+    if overlay: renv['DM_ROMFS_OVERLAY'] = overlay   # the profile's RomFS overlay (romfs_overlay)
     if gfx == 'nvn': renv['DM_NVN_SHMAP'] = g.table('shader_map.tsv')
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
     if env_file: renv.update(env_file_pairs(env_file))
     PROG.end(str(host))
     q = lambda v: shlex.quote(str(v))
     return f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' {q(host)} {q(patched)}'
+
+
+def romfs_overlay(py, game, patched, work, logs, g):
+    """A profile's romfs_overlay.py (Hades: the wide view's Lua and SJSON, dm/games/0100535012974000/romfs_overlay.py) writes changed and added RomFS files, made from the player's own
+    files, into <id>_build/romfs_overlay; it decides from the rewritten modules whether the build needs them. The Mac run takes the folder as DM_ROMFS_OVERLAY, the IPA packs its files
+    over the RomFS (build_ipa.sh ROMFS_OVERLAY). None when the profile has no such script or it wrote nothing. Made again every build (it takes a second)"""
+    script = Path(g.dir) / 'romfs_overlay.py'
+    if not script.is_file(): return None
+    out = work / 'romfs_overlay'
+    run([py, '-I', script, game / 'RomFS', patched, out], logs / 'romfs_overlay.log')
+    if not out.is_dir() or not any(p.is_file() for p in out.rglob('*')): return None
+    say(f'RomFS overlay of the game profile: {out}'); return out
 
 
 def find_repo(here):   # this file lives in the repository's scripts/; walk up to the level that has dm/tools/nx_extract/Program.cs
@@ -1654,6 +1667,7 @@ def main(args=None):
     patched = work / f'patched_{pkg_ver}'
     rewrite(py, repo, game / 'ExeFS', patched, env, logs, g)
     chain_header(py, repo, env, logs)   # before any host is built
+    overlay = romfs_overlay(py, game, patched, work, logs, g)
     if provisional or derived:   # the keys that need the rewritten modules, then (provisional) the heap check (both only change keys the host is built with, not the rewrite or the shader steps)
         provisional_prep(py, repo, env, logs, g)
         g = refine_after_rewrite(g, game, patched)
@@ -1676,7 +1690,7 @@ def main(args=None):
         pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
-        cmd = mac_run(py, repo, work, game, patched, ios, aoc, gfx, lang, env, logs, g, args.env_file or DM_ENV_FILE)
+        cmd = mac_run(py, repo, work, game, patched, ios, aoc, gfx, lang, env, logs, g, args.env_file or DM_ENV_FILE, overlay)
         rmtree(work / 'tmp')
         say(f'done: the game runs on the Mac with this command (its save in {work / "run/save"}, kept from run to run; DM_WINDOW=1 opens a window, DM_AUDIO=1 plays sound):')
         PROG.say(cmd)
@@ -1687,6 +1701,7 @@ def main(args=None):
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
     ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang)
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)
+    if overlay: ipa_env['ROMFS_OVERLAY'] = str(overlay)
     if app_version: ipa_env['DM_APP_VERSION'] = app_version
     # app icon: the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)

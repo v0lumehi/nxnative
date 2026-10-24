@@ -57,7 +57,16 @@ static uint64_t aspect_out(const char *aspect, uint64_t preset) {
     if (aspect) setenv("DM_ASPECT", aspect, 1); else unsetenv("DM_ASPECT");
     output_aspect(&m); uint64_t o; memcpy(&o, page + 0x40, 8); dm_fps_state = NULL; return o;
 }
+// The wide view flag (+0x4c) of a build with WIDE_VIEW stubs: on unless DM_ASPECT=bars; untouched for a build without them
+static uint32_t wide_flag(const char *aspect, uint64_t wv) {
+    static uint8_t page[0x60]; module_t m = {.name = "main", .out_w = 1280, .out_h = 720, .wide_view = wv};
+    memset(page, 0xee, sizeof page); dm_fps_state = page;
+    if (aspect) setenv("DM_ASPECT", aspect, 1); else unsetenv("DM_ASPECT");
+    wide_view(&m); uint32_t f; memcpy(&f, page + 0x4c, 4); dm_fps_state = NULL; return f;
+}
 static void aspect_test(void) {
+    assert(wide_flag(NULL, 1) == 1 && wide_flag("wide", 1) == 1 && wide_flag("2868:1320", 1) == 1 && wide_flag("bars", 1) == 0 && wide_flag(NULL, 0) == 0xeeeeeeee);
+    puts("wide view flag: on, off with DM_ASPECT=bars, untouched without WIDE_VIEW: OK");
 #define WH(w, h) ((uint64_t)(h) << 32 | (w))
     assert(aspect_out(NULL, 0) == 0);   // wide by the profile, but no front end aspect (front_screen_aspect's weak 0): the game's size
     assert(aspect_out("16:9", 0) == 0 && aspect_out("4:3", 0) == 0);   // never narrower than 16:9
@@ -66,6 +75,7 @@ static void aspect_test(void) {
     assert(aspect_out("2868:1320", WH(1920, 1080)) == WH(2344, 1080));   // DM_OUTPUT_SIZE's height
     assert(aspect_out("2556:1179", 0) == WH(1560, 720));   // iPhone 15 / 16
     puts("wide output: 1568x720 at 2868:1320, DM_OUTPUT_SIZE's height kept, never below 16:9: OK");
+    assert(aspect_out("bars", WH(1568, 720)) == WH(1568, 720));   // the side bars: the same output (no front end aspect here: DM_OUTPUT_SIZE's)
 #else
     assert(aspect_out("2868:1320", 0) == 0);   // a profile without aspect any keeps its size
     puts("wide output: off without the profile key aspect any: OK");

@@ -873,14 +873,15 @@ for off, oid, ow, why in obs:
 # runs the original instructions), +4 TOTK movie flag, +8 double lead (TOTK), +0x10 float render scale (TOTK, BotW), +0x18 double game seconds (TOTK),
 # +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
 # its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). Fields a build's stubs read only when its fixups table names them
-# (the loader writes them for that build alone): +0x40 u64 output width | height << 32 and +0x48 float output width (OUTPUT_W / OUTPUT_H, the game's own size; 0 = the game's).
+# (the loader writes them for that build alone): +0x40 u64 output width | height << 32 and +0x48 float output width (OUTPUT_W / OUTPUT_H, the game's own size; 0 = the game's),
+# +0x4c u32 1 = widen the game's own view to the output's aspect (WIDE_VIEW; DM_ASPECT=bars writes 0). +0x80 to +0x8f: fields a build's stubs keep for themselves (Hades's logical screen).
 # Stub bodies assembled with clang
 # A build's stubs are FRAME_STEP[build ID](ctx) in its patches.py: ctx.here() / ctx.emit(word) assemble into the patch area, ctx.site(offset, original bytes) asserts a site and that it is
 # no rewrite site, ctx.put(offset, words, reason) writes it (listed with the cuts), ctx.state is the state page's offset, ctx.render_scale = 1 marks a render-scale stub, and
 # ctx.keys[KEY] = value adds a row to the fixups table for stubs the loader writes further state page fields for (OUTPUT_W / OUTPUT_H)
 FRAME_STEP = PATCHES['FRAME_STEP']
 FS_STATE_OFF = 0
-FS_STATE_SIZE = 0x50
+FS_STATE_SIZE = 0x90
 RENDER_SCALE = 0   # 1 = the build has a render-scale stub (state +0x10): the fixups table says so (RENDER_SCALE), and the iOS launcher offers the setting (dm/games/settings.tsv)
 FS_KEYS = {}   # further fixups table rows of the build's stubs (ctx.keys): the loader writes their state page fields for this build only
 if BUILD_ID in FRAME_STEP and NAME == 'main':

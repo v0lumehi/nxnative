@@ -193,6 +193,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "OUTPUT_W")) m->out_w = v;
         else if (!strcmp(key, "OUTPUT_H")) m->out_h = v;
+        else if (!strcmp(key, "WIDE_VIEW")) m->wide_view = v;
         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
@@ -214,28 +215,35 @@ static void read_layout(module_t *m, const char *dir) {
 uint8_t *dm_fps_state;
 static const module_t *g_fps_m;   // the module holding the state page
 static void install_fps_state(module_t *m) {
-    if (m->fps_state_off + 0x50 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
+    if (m->fps_state_off + 0x90 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_m = m;
 }
 // A wide output (profile key aspect any, Hades): a build whose stubs take any output size (OUTPUT_W / OUTPUT_H) renders at the screen's landscape aspect, so the picture fills it with no
 // bars, crop or stretch. DM_ASPECT=wide (the default for such a game; the iOS launcher's switch) takes the front end's aspect (front_screen_aspect: the iPhone's screen; the Mac's front
 // end has none, so its window keeps 16:9), DM_ASPECT=W:H a given one (DM_ASPECT=2868:1320 tries the iPhone's on the Mac), 16:9 the game's own size. Never narrower than 16:9 (an iPad
 // keeps the game's picture). The height stays the one the game or DM_OUTPUT_SIZE gives; the width is height × aspect rounded to a multiple of 8, which the present path
-// (nvn_mtl.m present_encode) fills the screen with, as it fills directly when the aspect ratios differ by less than 1%
+// (nvn_mtl.m present_encode) fills the screen with, as it fills directly when the aspect ratios differ by less than 1%.
+// A build whose stubs can also widen the game's own view and layout (WIDE_VIEW in its rewriter table: Hades's port of the PC mod Hephaistos) gets the state page's +0x4c = 1, so a
+// wider output shows more of the game; DM_ASPECT=bars takes the same aspect as wide but writes 0, and the game keeps its own 16:9 layout for it (Hades: its side bar art)
 __attribute__((weak)) double front_screen_aspect(void) { return 0; }   // front_ios.m; the Mac and the unit tests have none
 static void output_aspect(const module_t *m) {
     const char *e = getenv("DM_ASPECT");
     if (!DM_GAME_ASPECT_ANY || !m->out_w) { if (e && strcmp(e, "16:9")) LOG("[RED] DM_ASPECT=%s: %s; keeping 16:9", e, !DM_GAME_ASPECT_ANY ? "the game profile has no aspect any" : "this build has no output size stub"); return; }
     double a = 0, x = 0, y = 0; char c = 0;
-    if (!e || !strcmp(e, "wide")) a = front_screen_aspect();
-    else if (strcmp(e, "16:9")) { if (sscanf(e, "%lf:%lf%c", &x, &y, &c) == 2 && x > 0 && y > 0) a = x / y; else { LOG("[RED] DM_ASPECT=%s: must be wide, 16:9 or W:H; keeping 16:9", e); return; } }
-    if (a <= 16.0 / 9.0 + 1e-6) { if (e && strcmp(e, "16:9")) LOG("%s: DM_ASPECT=%s gives no wider picture than 16:9%s; keeping 16:9", m->name, e, a ? "" : " (the front end reports no screen aspect)"); return; }
+    if (!e || !strcmp(e, "wide") || !strcmp(e, "bars")) a = front_screen_aspect();
+    else if (strcmp(e, "16:9")) { if (sscanf(e, "%lf:%lf%c", &x, &y, &c) == 2 && x > 0 && y > 0) a = x / y; else { LOG("[RED] DM_ASPECT=%s: must be wide, bars, 16:9 or W:H; keeping 16:9", e); return; } }
+    if (a <= 16.0 / 9.0 + 1e-6) { if (e && strcmp(e, "16:9") && strcmp(e, "bars")) LOG("%s: DM_ASPECT=%s gives no wider picture than 16:9%s; keeping 16:9", m->name, e, a ? "" : " (the front end reports no screen aspect)"); return; }
     uint64_t osz; memcpy(&osz, dm_fps_state + 0x40, sizeof osz);
     uint32_t h = osz ? (uint32_t)(osz >> 32) : (uint32_t)m->out_h, w0 = osz ? (uint32_t)osz : (uint32_t)m->out_w, w = (uint32_t)(h * a + 4) & ~7u;
     if (w > 7680) { LOG("[RED] %s: aspect %.3f at height %u needs width %u, above 7680; keeping %ux%u", m->name, a, h, w, w0, h); return; }
     osz = (uint64_t)h << 32 | w; float owf = (float)w;
     memcpy(dm_fps_state + 0x40, &osz, sizeof osz); memcpy(dm_fps_state + 0x48, &owf, sizeof owf);
     LOG("%s: output %ux%u in place of %ux%u (aspect %.3f, DM_ASPECT %s)", m->name, w, h, w0, h, a, e ? e : "wide by the game profile");
+}
+static void wide_view(const module_t *m) {   // the wide view (WIDE_VIEW) at +0x4c: on unless DM_ASPECT=bars; the stubs widen nothing while the output is 16:9 or narrower
+    if (!m->wide_view) return;
+    const char *e = getenv("DM_ASPECT"); uint32_t on = !(e && !strcmp(e, "bars")); memcpy(dm_fps_state + 0x4c, &on, sizeof on);
+    if (!on) LOG("%s: the game's own 16:9 layout at a wider output (DM_ASPECT=bars)", m->name);
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs. The fields beyond +0x40 are written only for a build whose rewriter table names their stubs
@@ -263,6 +271,7 @@ void dm_fps_state_apply(void) {
         } else LOG("[RED] DM_OUTPUT_SIZE=%s: must be WxH (640x360 to 7680x4320), 1080p, 1440p or 4k; keeping %llux%llu", os, (unsigned long long)m->out_w, (unsigned long long)m->out_h);
     } else if (os) LOG("[RED] DM_OUTPUT_SIZE=%s: this build has no output size stub; keeping the game's size", os);
     output_aspect(m);
+    wide_view(m);
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", name, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }

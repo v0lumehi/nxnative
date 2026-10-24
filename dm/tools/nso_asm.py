@@ -26,3 +26,13 @@ def BEQ(frm, to):
 def BRK(imm): return 0xD4200000 | ((imm & 0xFFFF) << 5)
 def BLR(n): return 0xD63F0000 | (n << 5)
 NOP = 0xD503201F
+# PC-relative loads and addresses (±1 MB), compare-and-branch and a wide move, for stubs that read the state page (dm/games/0100535012974000/patches.py)
+def LDR_LIT(kind, t, pc, target):   # ldr wt / xt / st / dt, <PC-relative literal>
+    off = target - pc; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+    return {'w': 0x18000000, 'x': 0x58000000, 's': 0x1C000000, 'd': 0x5C000000}[kind] | (((off >> 2) & 0x7FFFF) << 5) | t
+def ADR(d, pc, target):
+    off = target - pc; assert -(1 << 20) <= off < (1 << 20)
+    return 0x10000000 | ((off & 3) << 29) | (((off >> 2) & 0x7FFFF) << 5) | d
+def CBZ_X(t, pc, target): return 0xB4000000 | ((((target - pc) >> 2) & 0x7FFFF) << 5) | t
+def CBZ_W(t, pc, target): return 0x34000000 | ((((target - pc) >> 2) & 0x7FFFF) << 5) | t
+def MOVZ_X16(d, imm): return 0xD2A00000 | (imm << 5) | d   # movz xd, #imm, lsl #16

@@ -4,7 +4,8 @@
 # deflate level 6, a file whose deflate is not smaller is stored (zip's rule), and names ending in a --store suffix are always stored (the profile's zip_store, compared without regard to case).
 # Speed (Info-ZIP managed about 100 MB/s on the T7): files up to BIG are read, and deflated, by a thread pool (zlib releases the GIL) while this thread writes them in order;
 # bigger files are streamed here, their CRC patched into the local header afterwards (no data descriptors). Zip64 fields wherever a size, an offset or the entry count passes its 32 / 16-bit field.
-# Usage: pack_ipa.py <out.ipa> [--store .a:.b] [--skip <archive path>]... <archive path>=<source folder>...
+# Usage: pack_ipa.py <out.ipa> [--store .a:.b] [--skip <archive path>]... <archive path>=<source folder or file>...
+#   a file mapping replaces the file of that name in an earlier mapping's folder, or adds it (a RomFS overlay); folders it needs that no folder has are added
 #   --skip: an archive path left out of the walk of the folder that holds it (folders a stale app build still has, the signature); a mapping of its own still adds it
 #   Writes <out.ipa>.partial and renames it at the end; prints "pack: N entries, X bytes" first (the NSP script's progress total, X = the files' bytes) and a summary line last
 import argparse, collections, concurrent.futures as cf, os, stat, struct, sys, time, zlib
@@ -39,6 +40,7 @@ def entries(maps, skip):
         for i in range(1, len(parts)):
             p = '/'.join(parts[:i]) + '/'
             if p not in seen: add(p, None, None)
+        if os.path.isfile(src): add(arc, src, os.stat(src)); continue
         add(arc + '/', src, os.stat(src)); walk(src, arc)
     return out
 
@@ -131,7 +133,7 @@ def main():
     maps = []
     for m in a.maps:
         arc, sep, src = m.partition('=')
-        if not sep or not arc.strip('/') or not os.path.isdir(src): sys.exit(f'[RED] pack_ipa: not <archive path>=<folder>: {m}')
+        if not sep or not arc.strip('/') or not (os.path.isdir(src) or os.path.isfile(src)): sys.exit(f'[RED] pack_ipa: not <archive path>=<folder or file>: {m}')
         maps.append((arc.strip('/'), src))
     store = tuple(s.lower() for s in a.store.split(':') if s)
     t0 = time.time()

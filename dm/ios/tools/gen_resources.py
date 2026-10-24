@@ -33,6 +33,7 @@ def main():
         'DM_RESOURCE_SHADERS': str(Path(shaders).resolve()),
         'DM_RESOURCE_MSLDIR': msldir,
         'DM_RESOURCE_AOC': str(Path(aoc).resolve()) if aoc and Path(aoc).is_dir() else '',
+        'DM_RESOURCE_ROMFS_OVERLAY': str(Path(os.environ['ROMFS_OVERLAY']).resolve()) if os.environ.get('ROMFS_OVERLAY') else '',   # build_ipa.sh's ROMFS_OVERLAY, copied over the RomFS
         'DM_RESOURCE_CHAIN_H': str(Path(chain_h).resolve()),   # dm/gfx/nvn/dmsh_chain.h, which the host is compiled with (one chain version for every game)
     }
     (ios / 'Gen/resources.env').write_text(
