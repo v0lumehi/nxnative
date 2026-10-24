@@ -1245,7 +1245,33 @@ static int ub_skip(const char *key) {   // Whether this phase should drop draws 
     return 0;
 }
 static long ab_len(void); static void ab_frame(uint64_t f);
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); }
+// DM_GPU_CAPTURE=<frame>[:<frames>] (diagnostic): a Metal GPU trace of those frames (default 1), or DM_GPU_CAPTURE=gpu:<ms>[:<after frame>] of one frame in the first scene whose GPU time passes <ms>, for Xcode's Metal debugger (per-draw cost, shader profiler). Written to the working
+// directory as dm_f<frame>.gputrace: the app's Documents on iOS, which needs a build with MetalCaptureEnabled (DM_METAL_CAPTURE=1 when the project is made); the run folder on the Mac,
+// which needs MTL_CAPTURE_ENABLED=1 in the environment. It captures the Metal 4 queue (Metal refuses to capture a Metal 4 device), so the old-queue helpers (present, some uploads) are not in it
+static long g_cap_f0 = -2, g_cap_n; static int g_cap_on;
+static void gpu_capture_frame(uint64_t f) {
+    static char last[32];   // read again when it changes (the Mac's DM_CTL "env DM_GPU_CAPTURE=<frame>")
+    { const char *e = getenv("DM_GPU_CAPTURE"); if (!g_cap_on && e && strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); g_cap_f0 = -2; } }
+    static double gpu_thr; static long after;
+    if (g_cap_f0 == -2) { const char *e = getenv("DM_GPU_CAPTURE"); gpu_thr = 0;
+        if (e && !strncmp(e, "gpu:", 4)) { gpu_thr = atof(e + 4); const char *c = strchr(e + 4, ':'); after = c ? atol(c + 1) : 0; g_cap_n = 1; g_cap_f0 = gpu_thr > 0 ? 0 : -1;
+            if (gpu_thr > 0) MLOG("DM_GPU_CAPTURE: the first frame after frame %ld that follows one with more than %.1f ms of GPU time is captured", after, gpu_thr); }
+        else { g_cap_f0 = e ? atol(e) : -1; g_cap_n = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : 1; if (g_cap_n < 1) g_cap_n = 1; if (g_cap_f0 <= 0) g_cap_f0 = -1; } }
+    if (g_cap_f0 < 0) return;
+    if (gpu_thr > 0 && !g_cap_on && f > 8 && (long)f >= after) { double g = mtl_gpu_ms(f - 8); if (g >= gpu_thr) g_cap_f0 = (long)f; }   // DM_GPU_CAPTURE=gpu:<ms>[:<after frame>]: a heavy scene, whenever it comes
+    MTLCaptureManager *m = [MTLCaptureManager sharedCaptureManager];
+    if (!g_cap_on && f == (uint64_t)g_cap_f0) {
+        if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) { MLOG("[RED] DM_GPU_CAPTURE: this build cannot write GPU traces (iOS: MetalCaptureEnabled, a build made with DM_METAL_CAPTURE=1; Mac: MTL_CAPTURE_ENABLED=1)"); g_cap_f0 = -1; return; }
+        char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, ".");
+        NSString *path = [NSString stringWithFormat:@"%s/dm_f%llu.gputrace", cwd, (unsigned long long)f];
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        MTLCaptureDescriptor *d = [MTLCaptureDescriptor new]; d.captureObject = g_q4 ? (id)g_q4 : (id)g_dev; d.destination = MTLCaptureDestinationGPUTraceDocument; d.outputURL = [NSURL fileURLWithPath:path];
+        NSError *err = nil;
+        if ([m startCaptureWithDescriptor:d error:&err]) { g_cap_on = 1; MLOG("DM_GPU_CAPTURE: capturing frames %llu to %llu into %s", (unsigned long long)f, (unsigned long long)(f + g_cap_n - 1), path.UTF8String); }
+        else { MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String); g_cap_f0 = -1; }
+    } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
+}
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
 static void gpu_tag_begin(uint64_t f) {
@@ -4606,6 +4632,9 @@ static int pso4_on(void) {
         v = !(e && !strcmp(e, "0"));
         if (!v) MLOG("DM_PSO_MTL4=0: render pipelines are built through the MTLDevice (no bases, no pipeline archive)");
 #endif
+        // Metal cannot capture pipelines made from bases ("Capturing Render pipeline specialization is not supported"), and its Metal 4 → 3 conversion for the capture layer
+        // crashes on the archives: a run that may capture GPU frames (DM_GPU_CAPTURE, MTL_CAPTURE_ENABLED) builds its pipelines through the MTLDevice
+        if (v && (getenv("DM_GPU_CAPTURE") || getenv("MTL_CAPTURE_ENABLED"))) { v = 0; MLOG("render pipelines through the MTLDevice in a run that may capture GPU frames (DM_GPU_CAPTURE / MTL_CAPTURE_ENABLED)"); }
     }
     return v;
 }
