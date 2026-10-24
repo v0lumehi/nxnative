@@ -3307,13 +3307,13 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     }
     if (stage == 2 && !j) return nil;   // missing geometry translation: the caller's red line says so
     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc];
-    // DM_MSL_VS_DIR=<folder beside the library folder> (measurement): vertex shaders load their main library from there when it has one, e.g. a set compiled with other
-    // Metal compiler options (without -fpreserve-invariance, built from the same MSL). Only the main library: the pulling and shadow-input ones, and pipelines built from bases
-    // (DM_PSO_MTL4), keep the usual set, so compare with DM_PSO_MTL4=0
-    if (stage == 0) { static NSString *alt; static dispatch_once_t once; dispatch_once(&once, ^{ const char *v = getenv("DM_MSL_VS_DIR");
-            if (v && *v) { alt = [g_msl_dir.stringByDeletingLastPathComponent stringByAppendingPathComponent:@(v)]; MLOG("DM_MSL_VS_DIR: vertex shader libraries from %s where it has them", alt.UTF8String); } });
-        static uint64_t n_alt; NSString *ap = alt ? [NSString stringWithFormat:@"%@/%@.metallib", alt, pc] : nil;
-        if (ap && [NSFileManager.defaultManager fileExistsAtPath:ap]) { lp = ap; if (!n_alt++) MLOG("DM_MSL_VS_DIR: first vertex shader from it: %s", pc.UTF8String); } }
+    // DM_MSL_VS_DIR / DM_MSL_FS_DIR=<folder beside the library folder> (measurement): vertex / fragment shaders load their main library from there when it has one, e.g. a set
+    // compiled with other Metal compiler options from the same MSL. Only the main library: the pulling and shadow-input ones, and pipelines built from bases (DM_PSO_MTL4), keep the
+    // usual set, so compare with DM_PSO_MTL4=0
+    if (stage == 0 || stage == 1) { static NSString *alt[2]; static dispatch_once_t once; dispatch_once(&once, ^{ const char *ev[2] = {"DM_MSL_VS_DIR", "DM_MSL_FS_DIR"};
+            for (int i = 0; i < 2; i++) { const char *v = getenv(ev[i]); if (v && *v) { alt[i] = [g_msl_dir.stringByDeletingLastPathComponent stringByAppendingPathComponent:@(v)]; MLOG("%s: %s shader libraries from %s where it has them", ev[i], i ? "fragment" : "vertex", alt[i].UTF8String); } } });
+        static uint64_t n_alt[2]; NSString *ap = alt[stage] ? [NSString stringWithFormat:@"%@/%@.metallib", alt[stage], pc] : nil;
+        if (ap && [NSFileManager.defaultManager fileExistsAtPath:ap]) { lp = ap; if (!n_alt[stage]++) MLOG("%s: first shader from it: %s", stage ? "DM_MSL_FS_DIR" : "DM_MSL_VS_DIR", pc.UTF8String); } }
     id<MTLLibrary> lib = lib_from_file(lp, &e);
     if (!lib || !j) { MLOG("[RED] failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reflection json"); return nil; }
     if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("[RED] shader %s has translation chain version %s, but this host expects %s", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
