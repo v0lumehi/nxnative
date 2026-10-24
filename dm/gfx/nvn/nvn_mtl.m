@@ -8694,6 +8694,10 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     return 1;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+// The display blit of each display-link present (its commit feedback): time from its GPU end to the target presentation time (negative: the drawable was not ready in time),
+// from its commit to its GPU start (the queue ahead of it), and its own GPU time; summarized on the "display link up to tick" line
+static double g_blit_slack[300], g_blit_q[300], g_blit_run[300]; static _Atomic uint64_t g_blit_n;
+static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -8771,8 +8775,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
+    double tgt = target_ts, cpu_c = CACurrentMediaTime();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String);
+        if (tgt > 0 && f.GPUEndTime > 0) { uint64_t i = g_blit_n++ % 300; g_blit_slack[i] = (tgt - f.GPUEndTime) * 1e3; g_blit_q[i] = (f.GPUStartTime - cpu_c) * 1e3; g_blit_run[i] = (f.GPUEndTime - f.GPUStartTime) * 1e3; }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
@@ -8791,6 +8797,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             MLOG("display link up to tick %llu: ticks 300, presents %llu, empty ticks %llu (held for the present interval %llu), old frames dropped by merging %llu; submission ahead of target display p50 %.3f ms / min %.3f ms; game enqueue to target display p50 %.3f ms / min %.3f / max %.3f ms",
                  (unsigned long long)g_link_tick_n, (unsigned long long)g_present_n, (unsigned long long)(g_link_tick_n - g_present_n), (unsigned long long)g_link_held,
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299]);
+            uint64_t bn = atomic_load(&g_blit_n); if (bn >= 300) { double sl[300], qq[300], rn[300]; memcpy(sl, g_blit_slack, sizeof sl); memcpy(qq, g_blit_q, sizeof qq); memcpy(rn, g_blit_run, sizeof rn);
+                int miss = 0; for (int i = 0; i < 300; i++) miss += sl[i] < 0; qsort(sl, 300, sizeof *sl, dcmp); qsort(qq, 300, sizeof *qq, dcmp); qsort(rn, 300, sizeof *rn, dcmp);
+                MLOG("display blits (last 300): done before the target p50 %.2f / p5 %.2f / min %.2f ms, %d after it; commit to GPU start p50 %.2f / p95 %.2f / max %.2f ms; GPU time p50 %.3f / max %.3f ms",
+                     sl[150], sl[15], sl[0], miss, qq[150], qq[285], qq[299], rn[150], rn[299]); }
         }
     }
     [g_q4 signalDrawable:dr];
