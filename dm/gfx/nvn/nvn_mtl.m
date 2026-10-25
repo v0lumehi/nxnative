@@ -8303,7 +8303,7 @@ static id<MTL4RenderCommandEncoder> scup_pass_begin(void) {
     MTL4RenderPassDescriptor *pd = [MTL4RenderPassDescriptor new]; MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[0];
     c.texture = g_scup_rt; c.loadAction = MTLLoadActionClear; c.clearColor = MTLClearColorMake(0, 0, 0, 0); c.storeAction = MTLStoreActionStore;
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
-    g_enc_mode = 0; g_pass_swrite = 0; g_sm_pass = 0; g_px_dcu = g_px_dcc = 0; g_nsd = 0; g_samp_bias = 0;
+    g_enc_mode = 0; g_pass_swrite = 0; g_sm_pass = 0; g_nsd = 0; g_samp_bias = 0;
     uint64_t ser = g_pass.serial + 1; memset(&g_pass, 0, sizeof g_pass); g_pass.serial = ser;
     g_pass.cfmt[0] = (uint32_t)g_scup_rt.pixelFormat; g_pass.samples = 1; g_pass.tw = g_scup_rt.width; g_pass.th = g_scup_rt.height;
     g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
