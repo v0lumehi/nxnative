@@ -19,6 +19,7 @@ t_cover
 t_fuse_check
 t_fuse_check.dSYM/
 t_present_crop
+t_scene_upscale
 t_present_crop.dSYM/
 t_reorder_chain
 t_reorder_chain.dSYM/
@@ -90,3 +91,4 @@ t_pull
 t_pull.dSYM/
 t_pull_inv
 t_pull_inv.dSYM/
+t_scene_upscale.dSYM/

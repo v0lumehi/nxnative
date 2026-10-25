@@ -27,6 +27,9 @@ fps_target	60
 # pipeline archive, the prepare step and the hybrid pipelines on the iPhone too (5,100 prewarm lines prepared in 0.28 s at start instead of compiling on first use)
 present_snap	on
 pso_mtl4	on
+# The draw that scales the 3D scene to the output before the HUD: agl's FXAA (agl_technique_pfx.sharcb), docked 1600x900 (0.8-1.0 of it with the dynamic resolution) into 1920x1080.
+# With DM_PRESENT_UPSCALE=metalfx-scene the output takes the screen's size, the FXAA runs at the scene's size and MetalFX scales its result into the output (README, Upscaling)
+scene_upscale	bd7ffdd435c6c3bc
 
 # ---- Versions ----
 # only the merged 1.9.0 copy is extracted; the base game's own build IDs are added when needed
