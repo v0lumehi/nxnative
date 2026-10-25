@@ -77,6 +77,48 @@ int main(void) { @autoreleasepool {
         EXPECT("sRGB swapchain present sends raw bytes, 64 pixels",0,bad);
     }
 #endif
+#ifndef CROP_LEGACY_HEADER
+    {   // DM_PRESENT_UPSCALE: which content MetalFX scales, and to which size (the picture's rectangle on the canvas)
+        unsigned ow=0,oh=0;
+        EXPECT("handheld 1280x720 on an iPhone 17 Pro Max (2868x1320) is upscaled",1,mtl_present_fx_size(1280,720,2868,1320,&ow,&oh));
+        EXPECT("  to the letterboxed picture's width 2347",2347,(int)ow);EXPECT("  and the screen's height 1320",1320,(int)oh);
+        EXPECT("1952x900 on 2868x1320 (ratio within 1 %) fills the canvas",1,mtl_present_fx_size(1952,900,2868,1320,&ow,&oh));
+        EXPECT("  width 2868",2868,(int)ow);EXPECT("  height 1320",1320,(int)oh);
+        EXPECT("1280x720 in a 2560x1440 Retina window",1,mtl_present_fx_size(1280,720,2560,1440,&ow,&oh));EXPECT("  width 2560",2560,(int)ow);
+        EXPECT("the same size is not upscaled",0,mtl_present_fx_size(1280,720,1280,720,&ow,&oh));
+        EXPECT("a picture larger than the canvas is not upscaled (bilinear down)",0,mtl_present_fx_size(1600,900,1280,720,&ow,&oh));
+        EXPECT("a square on a 2:1 canvas of its height is not upscaled",0,mtl_present_fx_size(8,8,16,8,&ow,&oh));
+        EXPECT("an empty content is not upscaled",0,mtl_present_fx_size(0,720,2868,1320,&ow,&oh));
+    }
+    if([MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) {   // the present pass through MetalFX into an offscreen canvas (present_offscreen_m4, as DM_NVN_SHOT_OUT uses it)
+        g_fx_mode=1;
+        const int N=64;MTLTextureDescriptor *bd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB width:N height:N mipmapped:NO];bd.storageMode=MTLStorageModeShared;bd.usage=MTLTextureUsageShaderRead;
+        id<MTLTexture> big=[g_dev newTextureWithDescriptor:bd];uint8_t *bp=malloc(N*N*4);
+        for(int y=0;y<N;y++)for(int x=0;x<N;x++)memcpy(bp+4*(y*N+x),colors[(x>=N/2)+2*(y>=N/2)],4);
+        for(int y=N/2;y<N;y++)for(int x=0;x<N/2;x++){uint8_t g[4]={128,64,200,255};memcpy(bp+4*(y*N+x),g,4);}   // lower-left quadrant: a mid grey-violet the sRGB bytes must keep
+        [big replaceRegion:MTLRegionMake2D(0,0,N,N) mipmapLevel:0 withBytes:bp bytesPerRow:N*4];free(bp);
+        res_add(big);res_commit();
+        const int W=4*N,H=2*N;MTLTextureDescriptor *od=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+        od.storageMode=MTLStorageModePrivate;od.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;id<MTLTexture> out=[g_dev newTextureWithDescriptor:od];
+        int zero2[4]={0};
+        EXPECT("MetalFX present into a 256x128 canvas succeeds",1,present_offscreen_m4(big,zero2,out));
+        EXPECT("  through a MetalFX scaler",1,g_fx_shot.sc!=nil);
+        EXPECT("  of the picture's 128x128 rectangle",128,(int)g_fx_shot.out.width);
+        id<MTLBuffer> rb=[g_dev newBufferWithLength:W*H*4 options:MTLResourceStorageModeShared];id<MTLCommandBuffer> cb=[g_q commandBuffer];id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+        [bl copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(W,H,1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:W*4 destinationBytesPerImage:W*H*4];
+        [bl endEncoding];[cb commit];[cb waitUntilCompleted];
+        const uint8_t *o=rb.contents;   // BGRA
+        #define PX(x,y,c) o[4*((y)*W+(x))+(c)]
+        int bars=0;for(int y=0;y<H;y++)for(int x=0;x<W;x++)if(x<64||x>=192)bars+=PX(x,y,0)||PX(x,y,1)||PX(x,y,2);
+        EXPECT("  black bars beside the square picture, 0 lit pixels",0,bars);
+        int bad=0;const int cxs[2]={64+32,64+96},cys[2]={32,96};
+        for(int q=0;q<4;q++){int x=cxs[q&1],y=cys[q>>1];const uint8_t *want=q==2?(const uint8_t[4]){128,64,200,255}:colors[q];
+            bad+=abs(PX(x,y,2)-want[0])>3||abs(PX(x,y,1)-want[1])>3||abs(PX(x,y,0)-want[2])>3;}
+        EXPECT("  quadrant centres keep their colours, raw bytes of the sRGB source (4 checked)",0,bad);
+        #undef PX
+        g_fx_mode=0;
+    } else printf("no Metal 4 MetalFX spatial scaler on this GPU: the MetalFX present is not checked\n");
+#endif
     int invalid[4][4]={{-1,0,4,4},{0,-1,4,4},{0,0,0,4},{7,0,4,4}};
     for(int i=0;i<4;i++) {
         MTLTextureDescriptor *dd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];dd.usage=MTLTextureUsageRenderTarget;dd.storageMode=MTLStorageModeShared;
