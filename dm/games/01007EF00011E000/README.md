@@ -226,7 +226,7 @@ General host changes first needed here; each applies to every game:
 
 - The GPU particles' compute dispatches and the G-buffer decals still split passes; about 800 MB of attachments a frame outdoors.
 - `DM_RENDER_SCALE` does not change the Mac's GPU time; the sources give no iPhone measurement.
-- `DM_PRESENT_UPSCALE=metalfx-scene` has not run on an iPhone (the launcher does not offer it): the cost there, and whether 2346x1320 leaves the render buffer pool enough room in scenes other than Zora's Domain's menus (the pool cannot grow on iOS; 7.9 MB stayed unused). Cutscenes and the camera rune were not checked.
+- `DM_PRESENT_UPSCALE=metalfx-scene` has not run on an iPhone (the launcher does not offer it): the cost there, and whether 2346x1320 leaves the render buffer pool enough room in scenes other than Zora's Domain's menus (the pool cannot grow on iOS; 7.9 MB stayed unused). Cutscenes and the camera rune were not checked. The output size is fixed at the start, so handheld mode with `metalfx-scene` still has the doubled pool (180 MB) and a window smaller than the screen shows the 1440p frame scaled down. The frame-time numbers under Upscaling were taken while another agent's shader build ran (load average 4–21): to repeat on a quiet machine. MetalFX could write into the display buffer directly instead of through a copy (under 0.1 ms).
 - The VFR override's `the game fixes its own step` path has not been reached on the Mac.
 - `game.tsv` still says "In bring-up", and its memory comment "until measured".
 - 05's `DM_PROBE_POLL` paragraph cites `PlacementMgr` in `main+0x5aaac0` as the one thread in guest code "for that flag" without naming the game; `PlacementMgr` is this game's.
