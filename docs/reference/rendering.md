@@ -211,6 +211,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md): every tenth frame filters the environment cube map in 132 passes (22 levels of 6 faces); 284 → 173 render passes in that frame, frame p95 13.2 → 11.1 ms at 900p on an M2 Max.
 - **Check:** `DM_NVN_TEXDUMP=layers=100:path` dumps the first such frame with and without the switch: the 173 targets matched (105 identical, the rest within 1% RMSE, the scene's rain).
 
+### Compute dispatches between the draws of a pass run ahead of it
+
+- **Symptom:** a GPU-bound frame with many passes on the same targets, one after the other, each preceded by a compute encoder of one dispatch (`DM_NVN_GPUPROF`: `compute / copy after pass … dispatches 1` between render passes of the same size); about 4 ms of GPU idle a frame inside command buffers in Metal System Trace.
+- **Cause:** Metal cannot dispatch compute inside a render pass, so every dispatch between two draws ends the pass; on Apple GPUs each extra pass and encoder costs its fixed 35–40 µs plus the store and reload of every attachment.
+- **Fix:** `cs_hoist_try` (`nvn_mtl.m`, `DM_NVN_CS_HOIST`, on by default, `0` off): when a draw opens a pass, the ops up to the first one that would end the pass anyway are scanned, and each dispatch met on the way runs before the pass when moving it ahead of the draws before it changes nothing they read (no storage buffer they read, no colour attachment of the pass sampled, no image written, the draws write no memory). A dispatch that samples the pass's depth moves only while no draw before it in the pass writes depth, so it sees the same depth. `DM_NVN_PASSDUMP` prints `H … dispatch … moved ahead of the pass`; the residency set line counts moved dispatches and why scans stopped.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md): the NintendoWare VFX GPU particles run one dispatch per emitter between the effect draws of the G-buffer and of the half-resolution passes; 28 → 8 compute encoders and 149 → 132 render passes a frame, frame p50 9.9 → 9.0 ms at 900p on an M2 Max. Its particle collision samples the G-buffer depth, and no draw before those dispatches writes depth (counted: 0 stops).
+- **Check:** the cube-filter frame's 173 targets dumped with and without (`DM_NVN_TEXDUMP=layers=100`): every 3D target within 0.7% RMSE; only the 2D overlay of the final picture differed (a loading banner's animation, timed by the wall clock).
+
 ### Clears of attachments larger than the render pass
 
 - **Symptom:** a scene drawn only in a small square in the top-left corner of a black screen; speckled and blocky patches; a full-screen overlay showing one tile; the texture dump right after the scene pass shows the picture only in the corner, and `DM_NVN_HILITE` on the scene's shaders lights only the corner.
