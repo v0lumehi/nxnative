@@ -1722,7 +1722,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // frame (16 KB pages; the protecting itself costs time, so frame times do not count in such a run)
         static int wp = -1; static uint64_t f0, acc, accp, nfr; if (wp < 0) wp = getenv("DM_NVN_WPROBE") != NULL;
         if (wp) { uint64_t fa, pr; nvn_dirty_stats(&fa, &pr); if (nfr++) { acc += fa - f0; } uint64_t m0 = now_ns(); nvn_dirty_protect_all(); accp += now_ns() - m0; nvn_dirty_stats(&f0, &pr);
-            if (nfr % 300 == 0) { LOG("[wprobe] up to present %llu: the CPU wrote %.1f tracked pages a frame (%.2f MB), protecting all took %.2f ms a frame", (unsigned long long)o->presents, acc / 299.0, acc / 299.0 * 16384 / 1048576.0, accp / 300.0 / 1e6); acc = accp = 0; nfr = 1; } }
+            // the faulted pages of this frame against the pages the GPU reads directly in this frame and the one before (mtl_rset_frame)
+            static uintptr_t *wl; static uint64_t from, hits, rds; void mtl_rset_frame(const uintptr_t *, uint64_t, uint64_t *, uint64_t *);
+            if (!wl) { wl = malloc(65536 * sizeof *wl); nvn_dirty_fault_log(1); }
+            uint64_t n0 = from; from = nvn_dirty_fault_take(wl, from, 65536); uint64_t h, r; mtl_rset_frame(wl, from - n0 < 65536 ? from - n0 : 65536, &h, &r); hits += h; rds += r;
+            if (nfr % 300 == 0) { LOG("[wprobe] up to present %llu: the CPU wrote %.1f tracked pages a frame (%.2f MB), %.1f of them pages the GPU reads directly (of %.1f such pages a frame); protecting all took %.2f ms a frame",
+                (unsigned long long)o->presents, acc / 299.0, acc / 299.0 * 16384 / 1048576.0, hits / 300.0, rds / 300.0, accp / 300.0 / 1e6); acc = accp = hits = rds = 0; nfr = 1; } }
     }
     gfx_enter();
     uint64_t t0 = now_ns();
