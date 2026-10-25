@@ -135,6 +135,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** reduction samplers filter mips linearly (`samp_by_id`): at the integer LODs reductions are used with, that is the same level.
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md): its depth pyramid is built with a min-reduction sampler (`SamplerBuilderSetReductionFilter 1`; `151607c7a92386cc` samples the level above at an explicit LOD).
 
+### Sampler LOD bias
+
+- **Symptom:** textures a little blurrier than on the Switch where a game sharpens them with a sampler bias; no red line.
+- **Cause:** the sampler's LOD bias (`nvnSamplerBuilderSetLodBias`, Vulkan's `mipLodBias`) was dropped: Metal samplers had none until `MTLSamplerDescriptor.lodBias` (macOS and iOS 26).
+- **Fix:** `samp_by_id` (NVN) and `vkCreateSampler` set `lodBias` from the game's bias, clamped to Metal's -16 to 15.98. The OpenGL layer still reports `GL_TEXTURE_LOD_BIAS` with a red line.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): its G-buffer and shadow passes sample their material textures with a bias of -1; in Zora's Domain the mean absolute Laplacian of a frame's luma rose by 10–17 % in three regions with it.
+
 ## Render targets, passes and clears
 
 ### Transient render targets shared by storage
@@ -671,10 +678,10 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - Timestamps are their submit's completion time; occlusion queries count into a per-submit visibility buffer, copied to the pool when the submit completes.
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md): two timestamp pools and a 3,072-entry occlusion pool.
 
-### Not translated in the Vulkan layer: geometry shaders and LOD bias
+### Not translated in the Vulkan layer: geometry shaders
 
-- **Symptom:** GX points and lines drawn as one-pixel points and lines; a red line for the sampler LOD bias.
-- **Cause:** two geometry shaders (GX points and lines expanded to quads) are not translated (Metal has no geometry stage); GX's sampler LOD bias has no Metal sampler equivalent.
+- **Symptom:** GX points and lines drawn as one-pixel points and lines.
+- **Cause:** two geometry shaders (GX points and lines expanded to quads) are not translated (Metal has no geometry stage). GX's sampler LOD bias, reported here before, is now taken ([Sampler LOD bias](#sampler-lod-bias)).
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md).
 
 ## OpenGL layer
