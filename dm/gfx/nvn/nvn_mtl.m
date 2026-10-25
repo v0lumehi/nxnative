@@ -544,6 +544,9 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
 }
 
 // ---------- Submission ----------
+enum { RSK_VB, RSK_IB, RSK_IND, RSK_UBO, RSK_SSBO, RSK_SSBO_RW, RSK_TEX, RSK_COPY, RSK_N };
+static void rs_add(uint64_t a, uint64_t n, int kind); static void rs_tex(int tid);   // DM_NVN_WPROBE read set (mtl_rset_frame)
+static inline int pipe_on(void); static uint64_t pipe_read_buf(uint64_t a, uint64_t n, uint64_t gpu, int shadow, __unsafe_unretained id<MTLBuffer> *buf, size_t *off); static inline uint64_t pipe_read(uint64_t a, uint64_t n, uint64_t gpu, int shadow);   // frame pipelining (below)
 static void defer_reset(void); static void defer_fallback(void);
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; void *vis; uint32_t seg; } post_op;   // vis: the visibility slot table for kind 3; seg: the segment it was encoded in (sub_cut)
 static uint32_t g_seg;   // Index of the segment being encoded in this submission (0 until the first sub_cut)
@@ -936,11 +939,14 @@ static id<MTL4ComputeCommandEncoder> blit(void) {
 
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     pend_add(dst, n, 2); g_mdx_epoch++;
+    rs_add(src, n, RSK_COPY);
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
         MDIE("buffer copy address is in no memory pool src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
     if (src != dst && src < dst + n && dst < src + n) { static int once;   // Metal leaves an overlapping copy undefined; seen only in Cuphead while its pool allocator gave out overlapping blocks (hle_nvn.c zcull_size)
         if (!once++) MLOG("[RED] buffer copy with overlapping source and destination (src %#llx dst %#llx, %llu bytes): the result is undefined", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); }
+    if (pipe_on()) { __unsafe_unretained id<MTLBuffer> pb = nil; size_t po = 0; uint64_t g0 = ((__bridge id<MTLBuffer>)sb).gpuAddress + so;   // frame pipelining: the source as it is now
+        if (pipe_read_buf(src, n, g0, 1, &pb, &po) != g0 && pb) { sb = (__bridge void *)pb; so = po; } }
     enc_b_copy_buffer(blit_buf(src, src + n, dst, dst + n), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
@@ -1163,6 +1169,87 @@ static int ubp_get(uint64_t lo, uint64_t hi, uint64_t *gpu, const uint8_t **cpu)
     if (!c) c = &g_ubpc[g_ubpc_i++ % UBP_CACHE];
     *c = (ubp_ent){lo, hi, ab.gpuAddress + o, d, g_npend, g_pend_gen, g_sbw_gen, ready};
     *gpu = c->gpu; *cpu = d; g_ubp_ready = ready; return 1;
+}
+// ---------- Frame pipelining: direct reads of pool memory (DM_NVN_PIPELINE, hle_nvn.c pipe_fence) ----------
+// A pipelined frame's GPU work runs while the CPU writes the next frame, so what a binding reads straight from pool memory (vertex, index and indirect buffers, uniform and read-only
+// storage buffers, copy sources) must be what the CPU had written when the frame was submitted. Every such range goes through pipe_read at replay: on pages the CPU rewrites from frame
+// to frame (hot, nvn_dirty.c) it reads a shadow, a copy made now into the submission's arena (with the copy worker for large ones); on the others it reads memory, and the pages are
+// write-protected with this submission's fence, so a CPU write before the GPU is done waits for it (and turns the page hot). Ranges the GPU writes (copies, fills, storage writes, earlier
+// submissions still running) are not shadowed: their pages are protected instead. A shadow is kept for the rest of the submission while no write is queued in it (the same block is bound by
+// draw after draw)
+static int g_pipe = -1;
+static uint64_t pipe_done_fence(void) { return g_done; }
+__attribute__((weak)) int dm_fault_in_guest(void *uc) { (void)uc; return 1; }   // hle_thread.c: the faulting instruction is guest code (graphics unit tests: always)
+static inline int pipe_on(void) {
+    if (__builtin_expect(g_pipe >= 0, 1)) return g_pipe;
+    g_pipe = nvn_pipe_on(); if (g_pipe) { nvn_pipe_init(pipe_done_fence, dm_fault_in_guest); MLOG("frame pipelining: pool memory read directly is shadowed on pages the CPU rewrites and write-protected elsewhere"); }
+    return g_pipe;
+}
+enum { PS_DIRECT, PS_SHADOW, PS_SHADOW_REUSED, PS_UBP, PS_GPU_WRITTEN, PS_UNTRACKED, PS_NOSHADOW, PS_N };
+static uint64_t g_ps[PS_N], g_ps_bytes;   // bindings by outcome; bytes copied into shadows
+static const char *const ps_name[PS_N] = {"direct", "shadow made", "shadow reused", "uniform shadow (queued updates)", "GPU-written: protected", "untracked: shadow", "not shadowable: protected"};
+enum { PSPAN_N = 1024, PSH_N = 256 };
+static const void *g_pspan[PSPAN_N];   // tracked range by 64 KB of address (a hint nvn_pipe_span checks)
+static struct { uint64_t a, n, gpu, ready; uint32_t sub, npend, sbw; __unsafe_unretained id<MTLBuffer> buf; size_t off; } g_psh[PSH_N];   // this submission's shadows
+static const void *pipe_span(uint64_t a, uint64_t n) { unsigned k = (unsigned)((a >> 16) * 0x9E3779B97F4A7C15ull >> 54) & (PSPAN_N - 1); const void *s = nvn_pipe_span(g_pspan[k], a, a + n); g_pspan[k] = s; return s; }
+// The shadow of [a, a + n) as memory holds it now: GPU address, and the arena buffer / offset for a copy source (buf may be NULL)
+static uint64_t pipe_shadow(uint64_t a, uint64_t n, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
+    unsigned k = (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ n) >> 56) & (PSH_N - 1);
+    if (g_psh[k].sub == (uint32_t)g_sub_serial && g_psh[k].a == a && g_psh[k].n == n && g_psh[k].npend == (uint32_t)g_npend && g_psh[k].sbw == g_sbw_gen) {
+        g_ps[PS_SHADOW_REUSED]++; if (buf) { *buf = g_psh[k].buf; *off = g_psh[k].off; } return g_psh[k].gpu; }
+    size_t lo = (size_t)(a & 255);   // the shadow keeps the address's low bits (element alignment of index and vertex data)
+    id<MTLBuffer> ab; size_t o = arena_alloc((size_t)n + lo, &ab); uint8_t *d = (uint8_t *)ab.contents + o + lo;
+    uint64_t ready = 0; if (n >= 4096 && ubc_on()) ready = ubc_push(d, (const void *)(uintptr_t)a, (size_t)n); else memcpy(d, (const void *)(uintptr_t)a, (size_t)n);
+    if (ovl_on()) ready = ovl_apply(d, a, a + n, n >= 4096 && ubc_on(), ready);   // inline updates of submissions still running land in memory later: laid over
+    g_ps[PS_SHADOW]++; g_ps_bytes += n;
+    g_psh[k].a = a; g_psh[k].n = n; g_psh[k].gpu = ab.gpuAddress + o + lo; g_psh[k].ready = ready; g_psh[k].sub = (uint32_t)g_sub_serial; g_psh[k].npend = (uint32_t)g_npend; g_psh[k].sbw = g_sbw_gen; g_psh[k].buf = ab; g_psh[k].off = o + lo;
+    if (buf) { *buf = ab; *off = o + lo; }
+    return g_psh[k].gpu;
+}
+// Ranges found cold and stamped in this submission, while no page has turned hot or cold since (nvn_pipe_epoch): bound again without looking at their pages
+enum { PRC_N = 4096 };
+static struct { uint64_t a, n; uint32_t sub, epoch; } g_prc[PRC_N];
+static inline unsigned prc_slot(uint64_t a, uint64_t n) { return (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ (n * 0xC2B2AE3D27D4EB4Full)) >> 52) & (PRC_N - 1); }
+// What a binding of [a, a + n) reads (gpu: memory's own address). shadow: the binding only reads (a write must reach memory: storage written by the shader, image atomics)
+static uint64_t pipe_read_buf(uint64_t a, uint64_t n, uint64_t gpu, int shadow, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
+    if (!pipe_on() || !a || !n) return gpu;
+    uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
+    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) { g_ps[PS_DIRECT]++; return gpu; }
+    const void *span = pipe_span(a, n);
+    int hot = span ? nvn_pipe_hot(span, a, a + n) : -1;
+    uint32_t fence = (uint32_t)(g_fence + 1);
+    if (!hot) { nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_DIRECT]++; g_prc[k].a = a; g_prc[k].n = n; g_prc[k].sub = sub; g_prc[k].epoch = nvn_pipe_epoch(); return gpu; }
+    if (!shadow) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_NOSHADOW]++; return gpu; }
+    if ((g_nsbw && sbw_hits(a, a + n)) || g_sbw_over || gw_live(a, a + n)) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_GPU_WRITTEN]++; return gpu; }   // the GPU writes it: memory itself
+    if (pend_hits(a, n)) {   // copies, fills or inline updates queued in this submission over it: their bytes laid over memory (uniform-sized ranges), else memory itself
+        uint64_t g; const uint8_t *c; if (!buf && n <= 65536 && ubp_get(a, a + n, &g, &c)) { g_ps[PS_UBP]++; return g; }
+        if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_GPU_WRITTEN]++; return gpu; }
+    if (hot < 0) g_ps[PS_UNTRACKED]++;
+    return pipe_shadow(a, n, buf, off);
+}
+// Whether a page of [a, a + n) is hot, through the same cache (a vertex stream bound over a large buffer: only a hot one is narrowed to the draw's vertices)
+static int pipe_cold(uint64_t a, uint64_t n) {
+    uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
+    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) return 1;
+    const void *span = pipe_span(a, n);
+    return span && nvn_pipe_hot(span, a, a + n) == 0;
+}
+static inline uint64_t pipe_read(uint64_t a, uint64_t n, uint64_t gpu, int shadow) { return pipe_read_buf(a, n, gpu, shadow, NULL, NULL); }
+static void pipe_stats_line(void) {
+    static uint64_t prev[PS_N], prev_b, pd[12]; uint64_t d[12]; nvn_pipe_stats(d);
+    char line[1200]; int o = snprintf(line, sizeof line, "frame pipelining, per frame over 300:");
+    for (int i = 0; i < PS_N; i++) { o += snprintf(line + o, sizeof line - o, " %s %.1f;", ps_name[i], (g_ps[i] - prev[i]) / 300.0); prev[i] = g_ps[i]; }
+    o += snprintf(line + o, sizeof line - o, " shadow bytes %.2f MB; faults on read pages %.2f (stalled %.2f, %.3f ms; timeouts %llu; host writes %.2f), pages turned hot %.2f, probed %.2f, cooled %.2f, protected %.1f, hot ones protected again %.2f; hot list %llu",
+                  (g_ps_bytes - prev_b) / 300.0 / 1048576.0, (d[0] - pd[0]) / 300.0, (d[1] - pd[1]) / 300.0, (d[2] - pd[2]) / 300.0 / 1e6, (unsigned long long)d[3], (d[4] - pd[4]) / 300.0,
+                  (d[5] - pd[5]) / 300.0, (d[6] - pd[6]) / 300.0, (d[7] - pd[7]) / 300.0, (d[8] - pd[8]) / 300.0, (d[9] - pd[9]) / 300.0, (unsigned long long)d[10]);
+    prev_b = g_ps_bytes; memcpy(pd, d, sizeof pd);
+    MLOG("%s", line);
+}
+// At each present (hle_nvn.c): the probes, and the counters every 300 presents
+void mtl_pipe_present(void) {
+    if (!pipe_on()) return;
+    nvn_pipe_frame();
+    static uint64_t n; if (++n % 300 == 0) pipe_stats_line();
 }
 void mtl_ubp_stats(uint64_t *made, uint64_t *reused, uint64_t *refused) { *made = g_ubp_made; *reused = g_ubp_reused; *refused = g_ubp_refused; }
 void mtl_ubp_why(uint64_t w[5]) { memcpy(w, g_ubp_why, sizeof g_ubp_why); }
@@ -1491,6 +1578,7 @@ static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site) {
 // The game's SyncWait (hle_nvn.c), with what it waits for in the wait ledger
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) { return mtl_wait_at(fence, timeout_ns, !timeout_ns ? WS_SYNC_POLL : fence >= g_fence ? WS_SYNC_NEWEST : WS_SYNC); }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait_at(fence, timeout_ns, !timeout_ns ? WS_SYNC_POLL : WS_ACQ); }
+void mtl_pipe_wait_ready(void) { ubc_wait(ubc_head()); }   // the uniform shadows' copies (each commit waits for them already; a wait that returns early must not leave one behind)
 
 static void mtl_finish_gpu_at(int site) {
     if (g_fence) mtl_wait_at(g_fence, UINT64_MAX, site);
@@ -2044,6 +2132,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (g_nvn_deswz_gpu && !use_gpu && !sparse) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
+        if (pipe_on()) pipe_read((uint64_t)t->mem, t->L.size, 0, 0);   // frame pipelining: a CPU write before this upload has run waits for it
         up_begin();
         size_t stg_off;
         id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
@@ -4126,9 +4215,30 @@ static void ubd_dirty(uint64_t lo, uint64_t hi) {
 }
 // Resolved guest streams are separate from the table cache: vconv_bind may overwrite a stream's table slot.
 // Take the pool generation before resolving, so a concurrent pool change forces a fresh lookup next time.
-static void bind_vbufs(id<MTL4RenderCommandEncoder> en) {
+static int vc_draw_range(const p_draw *dw, const p_draw_idx *di, int64_t *lo, int64_t *hi);
+// Frame pipelining: what vertex stream s reads in this draw (gpu: memory's own address). A stream over pages the CPU rewrites reads a shadow of only the bytes the draw's vertices
+// (or instances) cover, when they can be told (vc_draw_range: a direct draw; an indexed one through its index range); otherwise of the whole bound range
+static uint64_t pipe_vb(int s, uint64_t gpu, uint32_t used, const p_draw *dw, const p_draw_idx *di) {
+    uint64_t a = S.vbuf[s].address, n = S.vbuf[s].size;
+    if (!pipe_on() || !(used >> s & 1) || !n) return gpu;
+    if (pipe_cold(a, n)) return pipe_read(a, n, gpu, 1);
+    uint32_t stride = S.stream[s].stride, div = S.stream[s].divisor, ext = 0;
+    for (int i = 0; i < 16 && i < S.nattr; i++) if (S.attr[i].fmt && S.attr[i].stream == (uint32_t)s && S.attr[i].offset + 16u > ext) ext = S.attr[i].offset + 16u;   // 16: the largest element
+    int64_t lo = 0, hi = 0; int known;
+    if (div) { uint32_t bi = dw ? dw->base_instance : di ? di->base_instance : 0; int32_t inst = dw ? dw->instances : di ? di->instances : 0;
+        known = !(dw && (dw->ind || dw->mdi_cnt)) && !(di && (di->ind || di->mdi_cnt)) && inst > 0; lo = bi; hi = (int64_t)bi + (inst - 1) / div; }
+    else known = vc_draw_range(dw, di, &lo, &hi);
+    if (!known || lo < 0 || hi < lo) return pipe_read(a, n, gpu, 1);
+    uint64_t b0 = (uint64_t)lo * stride, b1 = (uint64_t)hi * stride + ext;
+    if (b0 >= n) return gpu;   // past the bound range: nothing of it is read
+    if (b1 > n) b1 = n;
+    return pipe_read(a + b0, b1 - b0, gpu + b0, 1) - b0;
+}
+static uint32_t vb_used(void) { uint32_t u = 0; for (int i = 0; i < 16 && i < S.nattr; i++) if (S.attr[i].fmt && S.attr[i].stream < 16) u |= 1u << S.attr[i].stream; return u; }
+static void bind_vbufs(id<MTL4RenderCommandEncoder> en, const p_draw *dw, const p_draw_idx *di) {
     static struct { uint64_t addr, gpu, gen; } cache[16];
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    uint32_t used = pipe_on() ? vb_used() : 0;
     for (int s = 0; s < 16; s++) {
         uint64_t addr = S.vbuf[s].address, gpu;
         if (!addr) continue;
@@ -4138,6 +4248,7 @@ static void bind_vbufs(id<MTL4RenderCommandEncoder> en) {
             if (!mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) continue;
             cache[s].addr = addr; cache[s].gpu = gpu; cache[s].gen = gen;
         }
+        if (used) gpu = pipe_vb(s, gpu, used, dw, di);
         enc_r_vbuf(en, VB_SLOT(s), gpu);
     }
     static id<MTLBuffer> zero; static uint64_t zero_gpu;
@@ -4152,11 +4263,13 @@ enum { PULL_SLOT = 16 };   // = dmsh_pull.py SLOT
 typedef struct { uint64_t base; uint32_t stride, divisor; } pull_stream;
 typedef struct { pull_stream s[16]; uint32_t attr[16]; } pull_layout;
 _Static_assert(sizeof(pull_layout) == 320, "dmsh_pull.metal dm_vlayout");
-static void pull_layout_fill(pull_layout *Lp) {
+static void pull_layout_fill(pull_layout *Lp, const p_draw *dw, const p_draw_idx *di) {
     pull_layout L; memset(&L, 0, sizeof L); uint32_t lo[16] = {0};
+    uint32_t used = pipe_on() ? vb_used() : 0;
     for (int st = 0; st < 16; st++) {
         uint64_t addr = S.vbuf[st].address, gpu; void *mb; uint64_t mo;
         if (!addr || !mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) continue;
+        if (used) gpu = pipe_vb(st, gpu, used, dw, di);
         L.s[st].base = gpu & ~3ull; lo[st] = (uint32_t)(gpu & 3); L.s[st].stride = S.stream[st].stride; L.s[st].divisor = S.stream[st].divisor;
     }
     for (int a = 0; a < 16 && a < S.nattr; a++) {
@@ -4166,8 +4279,8 @@ static void pull_layout_fill(pull_layout *Lp) {
     }
     *Lp = L;
 }
-static void pull_bind(id<MTL4RenderCommandEncoder> en) {
-    pull_layout L; pull_layout_fill(&L);
+static void pull_bind(id<MTL4RenderCommandEncoder> en, const p_draw *dw, const p_draw_idx *di) {
+    pull_layout L; pull_layout_fill(&L, dw, di);
     id<MTLBuffer> ab; size_t off = arena_alloc(sizeof L, &ab);
     memcpy((uint8_t *)ab.contents + off, &L, sizeof L);
     enc_r_vbuf(en, PULL_SLOT, ab.gpuAddress + off);
@@ -5841,6 +5954,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 uint64_t g; const uint8_t *c; if (ubd_covers(u->addr, u->addr + ul)) gpu = ubd_shadow(u->addr, u->addr + ul);
                 else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;
                 else RED_ONCE(92, "a uniform update deferred inside the pass covers only part of the binding (stage %d cb%d): the content before the update is read", nvn_stage, reg); }
+            else gpu = pipe_read(u->addr, ul, gpu, 1);   // frame pipelining
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
@@ -5852,7 +5966,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                     FILE *f = fopen(p, "wb"); if (f) { fwrite((const void *)u->addr, 1, u->size, f); fclose(f); } else RED_ONCE(41, "CBDUMP cannot write %s", p);
                 }
             }
-            slots[aid] = gpu;
+            slots[aid] = gpu; rs_add(u->addr, ul, RSK_UBO);
             USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SAMPU && b->n) {   // the samplers of an array of handles in a uniform buffer: element k = the sampler ID of the handle at byte 8k (see the textures below)
             for (int k = 0; k < b->n; k++) {   // only registered IDs are looked up: most elements are other data the shader never picks as a handle
@@ -5897,7 +6011,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 else if (t.textureType == MTLTextureTypeTextureBuffer || (MTLTextureType)b->dtt == MTLTextureTypeTextureBuffer) { tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "a buffer texture: the slot reads 0 (dummy)"); t = nil; }
                 else tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "bound as is"); }
             if (t && nvn_stage == 1 && afr_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_red(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_red
-            if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
+            if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; } else rs_tex(tid);
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
@@ -5953,7 +6067,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (t && t.textureType != MTLTextureTypeTextureBuffer) { tex_mis_note(sh, nvn_stage, reg, tid, t, MTLTextureTypeTextureBuffer, "a buffer slot: it reads 0 (dummy)"); t = nil; }
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu fmt=%#x n=%u mem=%p", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
                        tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg ? g_treg[tid].t.d.width : 0, tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL);
-            if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+            if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; } else rs_tex(tid);
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_TEXD) {   // dynamic handle array (profile key tex_dyn_slots): element k = the texture in slot k (combined, else separate), since c2 holds slot indices for this shader (see DRV2 below)
@@ -6005,13 +6119,13 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, u->size, SBW_GPU); }   // cb_extent.tsv: slots the shader never writes
+            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu = pipe_read(u->addr, u->size, gpu, !(b->rw && !(b->kind == NVN_RB_SBUFP && reg < 32 && (sh->sb_ro >> reg & 1)))); rs_add(u->addr, u->size, b->kind == NVN_RB_UBOP ? RSK_UBO : b->rw && !(reg < 32 && (sh->sb_ro >> reg & 1)) ? RSK_SSBO_RW : RSK_SSBO); USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, u->size, SBW_GPU); }   // cb_extent.tsv: slots the shader never writes
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "real" : "dummy", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_SBUFU) {   // B: a storage buffer whose GPU address the game keeps in its own uniform buffer (Monster Hunter Rise's compute shaders: c3 + 0x38); read like a bindless handle
             uint64_t addr; ubo_read(nvn_stage, reg, b->off, 8, &addr);
             void *mb; uint64_t mo, gpu;
-            if (addr && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw) sbw_note(addr, 0, SBW_GPU); }   // size not known
+            if (addr && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) { slots[aid] = gpu; rs_add(addr, 256, b->rw ? RSK_SSBO_RW : RSK_SSBO); USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw) sbw_note(addr, 0, SBW_GPU); }   // size not known
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufu reg%d+%#x addr=%#llx %s", g_stat_pass, nvn_stage, reg, b->off, (unsigned long long)addr, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
@@ -8043,7 +8157,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     MTL4RenderPassDescriptor *d = [MTL4RenderPassDescriptor new]; d.renderTargetWidth = 1; d.renderTargetHeight = 1; d.defaultRasterSampleCount = 1;
     id<MTL4RenderCommandEncoder> en = enc_r_begin(d);
     enc_r_pso(en, ps);
-    bind_vbufs(en);
+    bind_vbufs(en, dw, NULL);
     vconv_bind(en, vs, 1, dw, NULL);
     args_dirty_all(); encode_args(en, vs, 0, 1);
     for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) {   // vertex v of the draw (first + i) stores at v × stride: the pointer starts first × stride before the write offset
@@ -8370,28 +8484,69 @@ static id<MTL4RenderCommandEncoder> scup_pass_begin(void) {
     return g_enc;
 }
 void mtl_scup_stats(uint64_t *done, uint64_t *kept) { *done = g_scup_n; *kept = g_scup_skip; }
-// DM_NVN_WPROBE read set: the 16 KB pages of pool memory the frame's draws let the GPU read directly (vertex and index buffers, indirect arguments, every bound uniform and storage
-// buffer; packaged textures are copies and are not counted), per frame, for the intersection with the pages the CPU writes (hle_nvn.c)
-enum { RS_N = 1 << 16 }; static uint64_t g_rs[2][RS_N]; static uint32_t g_rsg[2][RS_N]; static uint32_t g_rs_gen[2] = {1, 1}; static int g_rs_cur, g_rs_on = -1;
-static void rs_add(uint64_t a, uint64_t n) {
-    if (!a || !n) return; if (n > (64ull << 20)) n = 64ull << 20;
-    int c = g_rs_cur; for (uint64_t pg = a >> 14; pg <= (a + n - 1) >> 14; pg++) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
-        for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) { g_rsg[c][h] = g_rs_gen[c]; g_rs[c][h] = pg; break; } if (g_rs[c][h] == pg) break; } }
+// DM_NVN_WPROBE read set: the 16 KB pages of pool memory the frame's draws and dispatches let the GPU read directly, by binding kind (RSK_*: vertex and index buffers, indirect
+// arguments, the uniform and storage buffers a shader reads, linear and buffer textures, which are views of pool memory; packaged textures are copies and are not counted), per
+// frame, for the intersection with the pages the CPU writes (hle_nvn.c). The pages written in a frame that the frame before read are what the CPU would change under a GPU still
+// running that frame (frame pipelining); the bindings over the previous frame's such pages are what a shadow per binding would copy
+static const char *const rsk_name[RSK_N] = {"vertex", "index", "indirect", "uniform", "storage (read)", "storage (written)", "linear / buffer texture", "copy source"};
+enum { RS_N = 1 << 16 }; static uint64_t g_rs[2][RS_N]; static uint32_t g_rsg[2][RS_N]; static uint8_t g_rsk[2][RS_N]; static uint32_t g_rs_gen[2] = {1, 1}; static int g_rs_cur, g_rs_on = -1;
+enum { HS_N = 1 << 14 }; static uint64_t g_hs[2][HS_N]; static uint32_t g_hsg[2][HS_N], g_hs_gen[2] = {1, 1}; static int g_hs_cur;   // the hit pages of the last two frames (hs_has: the previous frame's)
+static uint64_t g_rs_cbytes[RSK_N], g_rs_cbind[RSK_N], g_rs_bind[RSK_N], g_rs_bytes[RSK_N];   // bindings over the previous frame's hit pages: bytes and count; all bindings: count and bytes
+static int rs_on(void) { if (g_rs_on < 0) g_rs_on = getenv("DM_NVN_WPROBE") != NULL; return g_rs_on; }
+static int hs_has(int c, uint64_t pg) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 50) & (HS_N - 1);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (HS_N - 1)) { if (g_hsg[c][h] != g_hs_gen[c]) return 0; if (g_hs[c][h] == pg) return 1; } return 0; }
+static void hs_add(int c, uint64_t pg) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 50) & (HS_N - 1);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (HS_N - 1)) { if (g_hsg[c][h] != g_hs_gen[c]) { g_hsg[c][h] = g_hs_gen[c]; g_hs[c][h] = pg; return; } if (g_hs[c][h] == pg) return; } }
+static void rs_add(uint64_t a, uint64_t n, int kind) {
+    if (!rs_on() || !a || !n) return; if (n > (64ull << 20)) n = 64ull << 20;
+    int c = g_rs_cur, hot = 0;
+    for (uint64_t pg = a >> 14; pg <= (a + n - 1) >> 14; pg++) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
+        if (!hot && hs_has(g_hs_cur ^ 1, pg)) hot = 1;
+        for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) { g_rsg[c][h] = g_rs_gen[c]; g_rs[c][h] = pg; g_rsk[c][h] = (uint8_t)(1u << kind); break; }
+            if (g_rs[c][h] == pg) { g_rsk[c][h] |= (uint8_t)(1u << kind); break; } } }
+    g_rs_bind[kind]++; g_rs_bytes[kind] += n; if (hot) { g_rs_cbind[kind]++; g_rs_cbytes[kind] += n; }
 }
-static int rs_has(int c, uint64_t pg) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
-    for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) return 0; if (g_rs[c][h] == pg) return 1; } return 0; }
-// The pages written since the last call that the GPU reads in this frame or the one before; the read set rolls over to the next frame
+static int rs_kinds(int c, uint64_t pg) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) return 0; if (g_rs[c][h] == pg) return g_rsk[c][h]; } return 0; }
+static void rs_tex(int tid) {   // a texture view of pool memory (tex_linear, the buffer textures): its storage (frame pipelining: write-protected, a texture view cannot be shadowed)
+    if (!(rs_on() || pipe_on()) || tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) return;
+    const tex_t *t = &g_treg[tid].t;
+    if (!t->mem || !(t->d.target == 10 || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)))) return;
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint64_t n = t->d.target == 10 ? (uint64_t)t->d.width * (bpb ? bpb : 4) : t->L.size ? t->L.size : (uint64_t)(t->d.stride ? t->d.stride : t->d.width * (bpb ? bpb : 4)) * (t->d.height ? t->d.height : 1);
+    if (rs_on()) rs_add((uint64_t)t->mem, n, RSK_TEX);
+    if (pipe_on()) pipe_read((uint64_t)t->mem, n, 0, 0);
+}
+// Called at each present with the pages written since the last call (w, one entry per write fault). Pages written that the previous frame's GPU work read (by kind) and this frame's,
+// how many of them were hit pages of the frame before too (the set's stability), and the bindings of this frame over the previous frame's hit pages
 void mtl_rset_frame(const uintptr_t *w, uint64_t nw, uint64_t *hit, uint64_t *reads) {
-    uint64_t h = 0; for (uint64_t i = 0; i < nw; i++) { uint64_t pg = (uint64_t)w[i] >> 14; if (rs_has(0, pg) || rs_has(1, pg)) h++; }
+    static uint64_t nfr, a_hit, a_hitc, a_prev, a_reads, a_kind[RSK_N], a_cb[RSK_N], a_cn[RSK_N], a_bn[RSK_N], a_bb[RSK_N], a_new;
+    int p = g_rs_cur ^ 1, hc = g_hs_cur;
+    uint64_t h = 0, hcur = 0, hprev = 0;
+    for (uint64_t i = 0; i < nw; i++) { uint64_t pg = (uint64_t)w[i] >> 14; int kp = rs_kinds(p, pg), kc = rs_kinds(g_rs_cur, pg);
+        if (kc) hcur++;
+        if (!kp || hs_has(hc, pg)) continue;   // each page once (a page in several overlapping pools faults once per pool)
+        hs_add(hc, pg); h++; if (hs_has(hc ^ 1, pg)) hprev++;
+        for (int k = 0; k < RSK_N; k++) if (kp >> k & 1) a_kind[k]++; }
     uint64_t r = 0; for (int i = 0; i < RS_N; i++) r += g_rsg[g_rs_cur][i] == g_rs_gen[g_rs_cur];
-    *hit = h; *reads = r; g_rs_cur ^= 1; g_rs_gen[g_rs_cur]++;
+    *hit = h; *reads = r;
+    a_hit += h; a_hitc += hcur; a_prev += hprev; a_reads += r; a_new += h - hprev;
+    for (int k = 0; k < RSK_N; k++) { a_cb[k] += g_rs_cbytes[k]; a_cn[k] += g_rs_cbind[k]; a_bn[k] += g_rs_bind[k]; a_bb[k] += g_rs_bytes[k]; g_rs_cbytes[k] = g_rs_cbind[k] = g_rs_bind[k] = g_rs_bytes[k] = 0; }
+    if (++nfr % 300 == 0) {
+        char line[1600]; int o = 0;
+        o += snprintf(line + o, sizeof line - o, "[wprobe] pipelining: pages written a frame that the previous frame's GPU work reads directly %.1f (%.1f of them hit the frame before too, %.1f new), written pages this frame's work read %.1f, read pages %.0f; by kind:",
+                      a_hit / 300.0, a_prev / 300.0, a_new / 300.0, a_hitc / 300.0, a_reads / 300.0);
+        for (int k = 0; k < RSK_N; k++) o += snprintf(line + o, sizeof line - o, " %s %.1f pages, bindings over them %.0f of %.0f (%.2f MB of %.2f MB);", rsk_name[k], a_kind[k] / 300.0, a_cn[k] / 300.0, a_bn[k] / 300.0, a_cb[k] / 300.0 / 1048576.0, a_bb[k] / 300.0 / 1048576.0);
+        MLOG("%s", line);
+        a_hit = a_hitc = a_prev = a_reads = a_new = 0; memset(a_kind, 0, sizeof a_kind); memset(a_cb, 0, sizeof a_cb); memset(a_cn, 0, sizeof a_cn); memset(a_bn, 0, sizeof a_bn); memset(a_bb, 0, sizeof a_bb);
+    }
+    g_rs_cur ^= 1; g_rs_gen[g_rs_cur]++; g_hs_cur ^= 1; g_hs_gen[g_hs_cur]++;
 }
 static void rs_draw(const p_draw *dw, const p_draw_idx *di) {
-    if (g_rs_on < 0) g_rs_on = getenv("DM_NVN_WPROBE") != NULL;
-    if (!g_rs_on) return;
-    for (int s = 0; s < 16; s++) rs_add(S.vbuf[s].address, S.vbuf[s].size);
-    for (int st = 0; st < 6; st++) for (int r = 0; r < 16; r++) { rs_add(S.ubo[st][r].addr, S.ubo[st][r].size); rs_add(S.ssbo[st][r].addr, S.ssbo[st][r].size); }
-    if (di) { rs_add(di->ibuf, (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4)); rs_add(di->ind, 20); } else if (dw) rs_add(dw->ind, 16);
+    if (!rs_on()) return;
+    uint32_t used = 0; for (int a = 0; a < 16 && a < S.nattr; a++) if (S.attr[a].fmt && S.attr[a].stream < 16) used |= 1u << S.attr[a].stream;
+    for (int s = 0; s < 16; s++) if (used >> s & 1) rs_add(S.vbuf[s].address, S.vbuf[s].size, RSK_VB);
+    if (di) { rs_add(di->ibuf, (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4), RSK_IB); rs_add(di->ind, 20, RSK_IND); } else if (dw) rs_add(dw->ind, 16, RSK_IND);
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     rs_draw(dw, di);
@@ -8534,9 +8689,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
       if (!(g_ed.ok & ED_BIAS) || memcmp(g_ed.bias, bi, sizeof bi)) { enc_r_depth_bias(en, bi[0], bi[1], bi[2]); memcpy(g_ed.bias, bi, sizeof bi); g_ed.ok |= ED_BIAS; }
       if (!(g_ed.ok & ED_CLIP) || g_ed.clip != cl) { enc_r_depth_clip(en, cl); g_ed.clip = cl; g_ed.ok |= ED_CLIP; }
       if (!(g_ed.ok & ED_BLEND) || memcmp(g_ed.blend, S.blend_color, sizeof g_ed.blend)) { enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]); memcpy(g_ed.blend, S.blend_color, sizeof g_ed.blend); g_ed.ok |= ED_BLEND; } }
-    if (cur_pull) { pull_bind(en); g_hy_draws++; }   // a pulling pipeline reads the streams itself (no conversion either: dm_fetch decodes every format)
+    if (cur_pull) { pull_bind(en, dw, di); g_hy_draws++; }   // a pulling pipeline reads the streams itself (no conversion either: dm_fetch decodes every format)
     else {
-        bind_vbufs(en);
+        bind_vbufs(en, dw, di);
         if (pr->sh[0]) vconv_bind(en, pr->sh[0], 0, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
     }
     g_kd_force = kd_draw(pr, dw, di);
@@ -8629,10 +8784,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         uint64_t ind = dw ? dw->ind : di->ind;
         if (ixc_wanted(dw, di)) { if (e && e->args) enc_r_draw_indexed_indirect(en, mp, MTLIndexTypeUInt32, e->ixb, e->ixlen, e->args); else RED_ONCE(88, "indirect draw skipped: the arguments for primitive %d were not converted (argument address %#llx is in no memory pool, or the conversion pipeline was not created)", prim, (unsigned long long)ind); }
         else if (!mdx && !mtl_addr(ind, dw ? 16 : 20, &ab, &ao)) RED_ONCE(88, "indirect draw skipped: argument address %#llx is in no memory pool", (unsigned long long)ind);
-        else if (dw) { enc_r_draw_indirect(en, mp, mdx ? mdx : ((__bridge id<MTLBuffer>)ab).gpuAddress + ao); if (mdx) mdx_chain(dw->mdi_cnt, dw->mdi_i, mp, MTLIndexTypeUInt32, 0, 0); }
+        else if (dw) { enc_r_draw_indirect(en, mp, mdx ? mdx : pipe_read(ind, 16, ((__bridge id<MTLBuffer>)ab).gpuAddress + ao, 1)); if (mdx) mdx_chain(dw->mdi_cnt, dw->mdi_i, mp, MTLIndexTypeUInt32, 0, 0); }
         else if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &ig)) RED_ONCE(22, "index buffer is in no memory pool");
         else { MTLIndexType ty = di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32; uint64_t il = ((__bridge id<MTLBuffer>)mb).length - mo;
-            enc_r_draw_indexed_indirect(en, mp, ty, ig, il, mdx ? mdx : ((__bridge id<MTLBuffer>)ab).gpuAddress + ao); if (mdx) mdx_chain(di->mdi_cnt, di->mdi_i, mp, ty, ig, il); }
+            enc_r_draw_indexed_indirect(en, mp, ty, ig, il, mdx ? mdx : pipe_read(ind, 20, ((__bridge id<MTLBuffer>)ab).gpuAddress + ao, 1)); if (mdx) mdx_chain(di->mdi_cnt, di->mdi_i, mp, ty, ig, il); }
     } else if (dw && prim == 7) {   // Quads: shared indices 0,1,2,0,2,3
         quad_ib_make();
         if (dw->count >= 4) enc_r_draw_indexed(en, mp, (dw->count / 4) * 6, MTLIndexTypeUInt32, g_quad_gpu, g_quad_ib.length, dw->instances > 0 ? dw->instances : 1, dw->first, dw->base_instance);
@@ -8684,7 +8839,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         void *mb; uint64_t mo;
         uint64_t gpu;
         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
-        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
+        uint64_t il = ((__bridge id<MTLBuffer>)mb).length - mo;
+        if (di->count && pipe_on()) { uint64_t n = (uint64_t)di->count << (di->itype == 1 ? 1 : 2); if (n > il) n = il; uint64_t g = pipe_read(di->ibuf, n, gpu, 1); if (g != gpu) { gpu = g; il = n; } }   // frame pipelining
+        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, il,
                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
@@ -8739,6 +8896,7 @@ static void dispatch(const p_dispatch *dp) {
     // DispatchComputeIndirect: the group counts {x, y, z} at ind (MTLDispatchThreadgroupsIndirectArguments) are usually written by the GPU earlier in the frame; Metal reads them when the dispatch runs
     void *ib = NULL; uint64_t io = 0, ig = 0;
     if (dp->ind && !mtl_gpu_addr(dp->ind, 12, &ib, &io, &ig)) { RED_ONCE(94, "indirect dispatch skipped: argument address %#llx is in no memory pool", (unsigned long long)dp->ind); return; }
+    if (dp->ind) { rs_add(dp->ind, 12, RSK_IND); ig = pipe_read(dp->ind, 12, ig, 1); }
     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
     NvShader *cs = prog_get(S.cprog)->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
@@ -8862,6 +9020,9 @@ static void copy_b2t(const p_copy_b2t *c) {
        c->tex->d.format, level, layer0, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, (unsigned long long)c->src, row, img);
     void *mb; uint64_t mo;
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(23, "buffer→texture copy source is in no memory pool"); return; }
+    rs_add(c->src, img * nz, RSK_COPY);
+    if (pipe_on()) { __unsafe_unretained id<MTLBuffer> pb = nil; size_t po = 0; uint64_t g0 = ((__bridge id<MTLBuffer>)mb).gpuAddress + mo;   // frame pipelining: the source as it is now
+        if (pipe_read_buf(c->src, img * nz, g0, 1, &pb, &po) != g0 && pb) { mb = (__bridge void *)pb; mo = po; } }
     g_cut_copy = 1;
     if (is3d && passdump()) { const char *dd = getenv("DM_NVN_CBDUMP"); if (dd) {   // the source bytes of a 3D upload, beside the uniform dumps (F<frame>_c3d_<serial>.bin)
         char p[1024]; snprintf(p, sizeof p, "%s/F%llu_c3d_%llu.bin", dd, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial);

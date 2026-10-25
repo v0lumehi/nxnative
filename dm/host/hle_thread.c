@@ -1060,4 +1060,6 @@ void dm_guest_bt(char *o, size_t n) {
     }
 }
 // Offset of a code address in main (~0 when it is not main's): for diagnostics keyed to a call site of the game (hle_nvn.c DM_NVN_SYNC_LAG)
+// Whether a fault's instruction is guest code (nvn_dirty.c frame pipelining: a guest write waits for the GPU, a host write never does)
+int dm_fault_in_guest(void *uc_) { ucontext_t *uc = uc_; return module_of((void *)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss)) != NULL; }
 uint64_t dm_main_off(const void *p) { module_t *m = module_of(p); return m && !strcmp(m->name, "main") ? (uint64_t)((const uint8_t *)p - (const uint8_t *)m->base) : ~0ull; }

@@ -182,8 +182,9 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     memcpy(pjob, &pj, sizeof pj);
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *rd = [MTL4RenderPassDescriptor new]; rd.renderTargetWidth = rd.renderTargetHeight = rd.defaultRasterSampleCount = 1;
-    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture); bind_vbufs(re);
+    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture);
     p_draw vertex_range = {.first = (int32_t)first, .count = (int32_t)span, .instances = instances, .base_instance = (int32_t)first_instance};
+    bind_vbufs(re, &vertex_range, NULL);
     vconv_bind(re, vs, 1, &vertex_range, NULL);
     args_dirty_all(); encode_args(re, vs, 0, 1); enc_r_vbuf(re, 13, capture_info);
     if (di0) enc_r_draw_indexed(re, MTLPrimitiveTypePoint, unique_count, MTLIndexTypeUInt32, capture_ix, nu * 4, instances, di.base_vertex, first_instance);

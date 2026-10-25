@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p logs
           cd dm/gfx/tests
-          tests="t_dirty_slots t_dirty_race t_pace t_fstep t_hmap t_cover t_pso_skey t_refl t_rt_range_ro t_present_rescue"
+          tests="t_dirty_slots t_dirty_race t_pipe t_pace t_fstep t_hmap t_cover t_pso_skey t_refl t_rt_range_ro t_present_rescue"
           make GAME="$GAME" -j3 $tests 2>&1 | tee ../../../logs/gfx-build.log
           failed=0
           for t in $tests; do

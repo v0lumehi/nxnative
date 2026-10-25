@@ -55,6 +55,8 @@ t_geometry
 t_geometry.dSYM/
 t_dirty_race
 t_dirty_race.dSYM/
+t_pipe
+t_pipe.dSYM/
 t_vin
 t_vin.dSYM/
 t_tbuf2d
