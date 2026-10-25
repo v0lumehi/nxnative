@@ -156,7 +156,7 @@ int main(void) { @autoreleasepool {
             state_reset(); S.nattr = 5; S.vbuf[2].address = (uint64_t)(uintptr_t)(mem + 64 + mis); S.stream[2].stride = ST;
             for (int a = 0; a < 4; a++) { S.attr[a].fmt = (uint32_t)fmts[a]; S.attr[a].offset = (uint32_t)offs[a]; S.attr[a].stream = 2; }
             S.attr[4].fmt = 0x2E; S.attr[4].stream = 5;   // stream 5 has no buffer
-            pull_layout P; pull_layout_fill(&P);
+            pull_layout P; pull_layout_fill(&P, NULL, NULL);
             EXPECT("base kept 4-byte aligned", 0, P.s[2].base & 3);
             EXPECT("attribute with no buffer reads zeros", 0, P.attr[4]);
             for (int a = 0; a < 4; a++) {
