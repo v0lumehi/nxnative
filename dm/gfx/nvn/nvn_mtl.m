@@ -4942,9 +4942,10 @@ int mtl_pso_prebuild_tool(void) {
     if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: nothing to do (no archive, no shader_pairs.tsv, or prebuilt.tsv says it is done)");
     return 1;
 }
-static void pso_prebuild_bg(void) {   // after the prewarm, in the app
+static int prepare_on(void);
+static void pso_prebuild_bg(void) {   // after the prewarm, in the app without a prepare step (with one, prepare_prebuild builds them before the first frame)
     const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return;
-    if (!hybrid_on()) return;
+    if (!hybrid_on() || prepare_on()) return;
     int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc <= 1) pc = 4;
     pso_prebuild(pc > 4 ? pc / 2 : 2, 0, QOS_CLASS_UTILITY);
 }
@@ -5193,6 +5194,22 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
          lines, (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_cps, (bp_now() - t0) / 1e9, workers, shown ? "shown" : "not shown",
          (unsigned long long)(g_pb_built - built0), (unsigned long long)(g_pb_archived - arch0), (unsigned long long)(g_pb_reused - reused0), (unsigned long long)(g_pb_spec - spec0));
 }
+// The prebuild in the prepare step: the bases of every shader pair are made before the game's first frame, behind the progress screen ("Preparing pipelines"), once per chain
+// version, depth mode and pair list (prebuilt.tsv), so a running game never compiles them meanwhile. Built in the background while playing, they took an iPhone 17 Pro Max's GPU
+// from about 13 to 15-18 ms a frame in Breath of the Wild (the compiler's load on the shared power budget); a first start waits for them instead
+static void prepare_prebuild(void) {
+    const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return;
+    if (!hybrid_on()) return;
+    int n = pso_prebuild(prepare_workers(), 0, QOS_CLASS_USER_INITIATED);
+    if (n <= 0) return;
+    uint64_t t0 = bp_now(); int shown = 0;
+    while (atomic_load(&g_pre_running)) {
+        usleep(50000);
+        if (!shown && bp_now() - t0 >= 500000000ull) shown = 1;
+        if (shown) front_progress("Preparing pipelines", g_pre_done, n);
+    }
+    if (shown) front_progress(NULL, n, n);
+}
 static void warm_start(void) {
     if (g_warm_started++) return;
     const char *e = getenv("DM_PSO_MANIFEST");
@@ -5219,6 +5236,7 @@ static void warm_start(void) {
         if (lines) warm_prepare(tasks, lines);
         else MLOG("pipeline prepare: the prewarm lists hold nothing to build");
         warm_finish();
+        @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
         return;
     }
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
