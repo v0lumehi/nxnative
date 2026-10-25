@@ -31,6 +31,7 @@ t_perf_order_tsan.dSYM/
 t_cube_placeholder
 t_cube_placeholder.dSYM/
 t_present_crop
+t_scene_upscale
 t_present_crop.dSYM/
 t_present_rescue
 t_present_rescue.dSYM/
@@ -120,3 +121,4 @@ t_pull_inv
 t_pull_inv.dSYM/
 t_present_snap
 t_present_snap.dSYM/
+t_scene_upscale.dSYM/

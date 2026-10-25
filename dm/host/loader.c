@@ -3,6 +3,7 @@
 #include "dm.h"
 #include <TargetConditionals.h>
 #include <fcntl.h>
+#include <math.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -231,6 +232,53 @@ static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x60 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_m = m;
 }
+__attribute__((weak)) int front_screen_px(int *w, int *h) { (void)w; (void)h; return 0; }   // front_mac.m, front_ios.m; none without a front end
+uint32_t dm_out_w, dm_out_h;   // the output size the host gave the game (scene_output), 0 = the game's own
+// The game's output at the size of its picture on the screen, for MetalFX on its 3D scene (DM_PRESENT_UPSCALE=metalfx-scene, nvn_mtl.m scup_draw). A profile that names the draw scaling
+// its scene to its output (scene_upscale) and a build whose stubs take the output size (OUTPUT_W / OUTPUT_H) compose each frame at that size: the game draws its HUD there at full
+// resolution and MetalFX scales only the scene into it, and the present shows the frame 1:1. The 3D views keep their size (the stubs make their scale the base view width over the
+// output width). The size: DM_OUTPUT_SIZE=<w>x<h>, else the game's output fitted into the screen with its aspect ratio (front_screen_px), when that is larger than the game's own. Fixed
+// at the start, where the game makes its display buffers. Breath of the Wild takes its display buffer and the inventory's output-sized buffers from its 115 MB render buffer pool
+// (RENDER_POOL; DM_NVN_POOLPEAK, the inventory, map and System menu open: 78.8 MB used at 1920x1080, 107.1 MB at 2346x1320, and at 2560x1440 the inventory crashed in
+// RenderBufferContext, main+0xed7128). On the Mac the pool doubles for any larger output, as for a render scale up to 1.41, up to SCENE_OUT_AREA_GROWN times the game's output area;
+// where it cannot grow (an iPhone: the guest's reservation cap, see dm_fps_state_apply) the output stays within SCENE_OUT_AREA, which an iPhone 17 Pro Max's 2346x1320 just fits
+#define SCENE_OUT_AREA 1.5
+#define SCENE_OUT_AREA_GROWN 8.0
+static void scene_output(const module_t *m, float sc) {
+    const char *up = getenv("DM_PRESENT_UPSCALE");
+    if (!up || strcmp(up, "metalfx-scene") || !DM_GAME_SCENE_UPSCALE[0] || !m->out_w || !m->out_h || !m->view_w) return;
+    uint64_t have; memcpy(&have, dm_fps_state + 0x40, sizeof have);
+    if (have) { LOG("%s: scene upscale: the output keeps the render scale's size (DM_RENDER_SCALE %.2f)", m->name, sc); return; }
+    const char *e = getenv("DM_OUTPUT_SIZE"); unsigned w = 0, h = 0; int sw = 0, sh = 0;
+    if (e && *e) { if (sscanf(e, "%ux%u", &w, &h) != 2 || w < 64 || h < 64 || w > 8192 || h > 8192) { LOG("[RED] DM_OUTPUT_SIZE=%s: must be <width>x<height>; using the screen's", e); w = h = 0; } }
+    if (!w && front_screen_px(&sw, &sh) && sw > 0 && sh > 0) {
+        if (sh > sw) { int x = sw; sw = sh; sh = x; }   // the game is landscape
+        double s = fmin((double)sw / m->out_w, (double)sh / m->out_h);
+        w = (unsigned)(m->out_w * s) & ~1u; h = (unsigned)(m->out_h * s) & ~1u;
+    }
+    if (!w || !h) { LOG("%s: scene upscale: the screen's size is not known; the output keeps %llux%llu", m->name, (unsigned long long)m->out_w, (unsigned long long)m->out_h); return; }
+    double area = (double)w * h / ((double)m->out_w * m->out_h), cap = SCENE_OUT_AREA;
+    if (area <= 1.0) { LOG("%s: scene upscale: the picture on the screen (%ux%u) is no larger than the game's output; it keeps %llux%llu", m->name, w, h, (unsigned long long)m->out_w, (unsigned long long)m->out_h); return; }
+    uint32_t k; memcpy(&k, dm_fps_state + 0x4c, sizeof k);
+    if (k >= 2) cap = SCENE_OUT_AREA_GROWN;   // already grown by the render scale
+#if TARGET_OS_OSX
+    else if (m->render_pool) {
+        int dm_mem_started(void);
+        uint64_t x = (m->render_pool + (64ull << 20) + 0x1fffff) & ~0x1fffffull; k = 2;
+        if (dm_mem_started()) LOG("[RED] %s: scene upscale: guest memory is already laid out; the render buffer pool keeps its size", m->name);
+        else { memcpy(dm_fps_state + 0x4c, &k, sizeof k); memcpy(dm_fps_state + 0x58, &x, sizeof x); dm_mem_extra = x; cap = SCENE_OUT_AREA_GROWN;
+            LOG("%s: scene upscale: render buffer pool x2, %.0f MB more application memory", m->name, x / 1048576.0); }
+    }
+#endif
+    if (area > cap) {
+        double s = sqrt(cap / area); w = (unsigned)(w * s) & ~1u; h = (unsigned)(h * s) & ~1u;
+        LOG("%s: scene upscale: output limited to %ux%u (%.2fx the game's area, what its render buffer pool holds)", m->name, w, h, cap);
+    }
+    uint64_t osz = (uint64_t)h << 32 | w; float owf = (float)w;
+    memcpy(dm_fps_state + 0x40, &osz, sizeof osz); memcpy(dm_fps_state + 0x48, &owf, sizeof owf); dm_out_w = w; dm_out_h = h;
+    LOG("%s: scene upscale: output %ux%u in place of %llux%llu%s; the 3D views keep their size (base %llux%llu)", m->name, w, h, (unsigned long long)m->out_w, (unsigned long long)m->out_h,
+        e && *e ? " (DM_OUTPUT_SIZE)" : " (the screen)", (unsigned long long)m->view_w, (unsigned long long)m->view_h);
+}
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs. The fields beyond +0x40 are written only for a build whose rewriter table names their stubs
 void dm_fps_state_apply(void) {
@@ -274,6 +322,7 @@ void dm_fps_state_apply(void) {
             LOG("%s: output %ux%u in place of %llux%llu (DM_RENDER_SCALE %.2f)", name, ow, oh, (unsigned long long)m->out_w, (unsigned long long)m->out_h, sc);
         }
     }
+    scene_output(m, sc);
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", name, !t ? "as the game sets it" : t > 60 ? "variable, the time each frame took" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
