@@ -634,11 +634,26 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 static _Atomic uint64_t g_sync_ns;
 __attribute__((weak)) void dm_guest_bt(char *o, size_t n) { if (n) o[0] = 0; }   // hle_thread.c; none in graphics unit tests
 __attribute__((weak)) uint64_t dm_main_off(const void *p) { (void)p; return ~0ull; }
+// Frame pipelining (DM_NVN_PIPELINE=1): a game that waits at the end of each frame for the work of the frame it has just presented (Breath of the Wild: its acquire sync and its own
+// FenceSync, both the newest fence) keeps the GPU idle while its CPU prepares the next frame and the CPU idle while the GPU draws. With pipelining, a wait for a fence that was
+// submitted before the last present but after the present before it waits only for the fence of the present before: the presented frame's GPU work runs on under the next frame's
+// CPU work, one frame in flight. A wait on work of the frame in progress (submitted after the last present: a readback) waits for it as before. The pages of pool memory the CPU
+// writes from frame to frame that the frame in flight reads directly are shadowed when it is replayed (nvn_mtl.m pipe_*), so the next frame's writes do not reach it
+static uint64_t g_pres_fence[8], g_npres;   // the queue's last fence at each present (any window)
+int nvn_pipe_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PIPELINE"); v = e && atoi(e) > 0; if (v) LOG("[nvn] frame pipelining (DM_NVN_PIPELINE): waits on the last presented frame's work wait for the frame before it"); } return v; }
+static uint64_t g_pipe_lag, g_pipe_full;   // waits moved one frame back / waits on the frame in progress (logged with the timing lines)
+static uint64_t pipe_fence(uint64_t fence) {
+    if (!nvn_pipe_on() || g_npres < 2) return fence;
+    uint64_t last = g_pres_fence[g_npres % 8], prev = g_pres_fence[(g_npres - 1) % 8];
+    if (fence > last) { g_pipe_full++; return fence; }
+    if (fence > prev) { g_pipe_lag++; mtl_pipe_wait_ready(); return prev; }
+    return fence;
+}
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
-    uint64_t fence = o->fence;
+    uint64_t fence = pipe_fence(o->fence);
     if (w(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     uint64_t t0 = now_ns(); int ok = w(fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
     {   // DM_NVN_SYNC_WHO=1 (diagnostic): the guest call stack of blocking SyncWaits, each distinct caller once (up to 8), with the fence's age
@@ -1705,6 +1720,9 @@ static void vstep_tick(const win_t *o) {
 static void vstep_off(void) { if (dm_fps_var_cap) { memset(dm_fps_state + 0x50, 0, 4); nvn_vstep_reset(&g_vstep); } }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++; o->pfence[o->presents % 4] = mtl_last_fence();
+    g_npres++; g_pres_fence[g_npres % 8] = mtl_last_fence();
+    mtl_pipe_present();
+    if (nvn_pipe_on() && g_npres % 300 == 0) { LOG("[nvn] frame pipelining up to present %llu: waits moved one frame back %.2f a frame, waits on the frame in progress %.2f", (unsigned long long)g_npres, g_pipe_lag / 300.0, g_pipe_full / 300.0); g_pipe_lag = g_pipe_full = 0; }
     dm_fps_lock_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
     if (fstep_on()) { if (vstep_on()) vstep_tick(o); else { vstep_off(); fstep_tick(o); } }
