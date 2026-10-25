@@ -22,7 +22,7 @@ class LauncherSettingsTests(unittest.TestCase):
                     self.assertEqual(len(found), int(api == 'nvn'))
                     if found:
                         self.assertEqual(found[0]['kind'], 'toggle')
-                        self.assertEqual(found[0]['default'], '0')
+                        self.assertEqual(found[0]['default'], '1')   # Breath of the Wild's profile: present_snap on
                         self.assertIn('latency', found[0]['note'])
 
 
