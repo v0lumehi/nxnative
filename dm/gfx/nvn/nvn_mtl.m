@@ -118,6 +118,35 @@ static _Atomic int g_last_commit_error;
 static _Atomic int g_up_pending;
 
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
+// Wait ledger (DM_NVN_WAITS=1): every place a thread of the host or the game waits on the CPU for the GPU or for the encode thread, counted per frame (calls, calls that blocked,
+// the time they blocked) and logged every 300 frames with the frame's GPU idle. The game's own SyncWait is split by how far its fence is behind the newest one (0: the last submission)
+enum { WS_SYNC, WS_SYNC_NEWEST, WS_SYNC_POLL, WS_ACQ, WS_FINISH, WS_ALLOC, WS_VIS, WS_PG, WS_MDI, WS_READTEX, WS_T2T, WS_DIAG, WS_SNAP, WS_UPZERO, WS_UPALLOC, WS_DRAIN, WS_UBC, WS_OLDQ, WS_N };
+static const char *const ws_name[WS_N] = {"SyncWait (game, older fence)", "SyncWait (game, newest fence)", "SyncWait polls", "SyncWait on an acquire sync", "QueueFinish", "allocator", "occlusion ring", "PASSGPU ring",
+    "indirect-count multi-draw", "texture readback", "texture copy t2t", "diagnostics", "snapshot ring", "upload batches", "upload slot", "encode thread drain", "uniform copy worker", "old-queue command buffer"};
+static _Atomic uint64_t g_ws_n[WS_N], g_ws_blk[WS_N], g_ws_ns[WS_N];
+static int ws_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_WAITS"); v = e && atoi(e) > 0; } return v; }
+static inline uint64_t ws_t0(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static inline void ws_put(int site, uint64_t t0, int blocked) {
+    atomic_fetch_add_explicit(&g_ws_n[site], 1, memory_order_relaxed);
+    if (blocked) { atomic_fetch_add_explicit(&g_ws_blk[site], 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_ws_ns[site], ws_t0() - t0, memory_order_relaxed); }
+}
+// For the game's waits: when each fence's command buffer ended on the GPU and when its feedback handler ran (CACurrentMediaTime), so a wait that blocked tells its wake-up delay
+static struct { _Atomic uint64_t fence; double gpu_end, fb; } g_fend[64];
+static _Atomic uint64_t g_ws_wake_n, g_ws_wake_ns, g_ws_fb_ns;
+static void ws_wake(uint64_t fence) {
+    unsigned k = fence % 64; if (atomic_load(&g_fend[k].fence) != fence || g_fend[k].gpu_end <= 0) return;
+    double now = CACurrentMediaTime(); atomic_fetch_add(&g_ws_wake_n, 1);
+    atomic_fetch_add(&g_ws_wake_ns, (uint64_t)((now - g_fend[k].gpu_end) * 1e9)); atomic_fetch_add(&g_ws_fb_ns, (uint64_t)((g_fend[k].fb - g_fend[k].gpu_end) * 1e9));
+    static int once; if (!once++) { char nm[64] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm); MLOG("[waits] first blocking SyncWait on the newest fence: thread '%s'", nm); }
+}
+static void ws_report(uint64_t frame, uint64_t frames) {
+    char line[2048]; size_t o = 0;
+    uint64_t wn = atomic_exchange(&g_ws_wake_n, 0), wns = atomic_exchange(&g_ws_wake_ns, 0), fns = atomic_exchange(&g_ws_fb_ns, 0);
+    if (wn) o += snprintf(line + o, sizeof line - o, " newest-fence SyncWait wakes %.3f ms after the GPU end (feedback handler at %.3f ms);", wns / 1e6 / wn, fns / 1e6 / wn);
+    for (int i = 0; i < WS_N; i++) { uint64_t n = atomic_exchange(&g_ws_n[i], 0), b = atomic_exchange(&g_ws_blk[i], 0), ns = atomic_exchange(&g_ws_ns[i], 0);
+        if (n && o < sizeof line - 160) o += snprintf(line + o, sizeof line - o, " %s %.2f/frame (blocked %.2f, %.3f ms);", ws_name[i], (double)n / frames, (double)b / frames, ns / 1e6 / frames); }
+    MLOG("[waits] up to frame %llu, per frame:%s", (unsigned long long)frame, o ? line : " none");
+}
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
 // Residency churn by call site (the power line every 300 frames, mtl_res_stats): each commit with changes is a kernel call whose cost grows with what was added or removed
@@ -623,6 +652,7 @@ static id<MTL4ComputeCommandEncoder> g_blit;
 static NSMutableArray<dispatch_block_t> *g_commit_blocks;
 static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc_grown;
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
+static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);
 static void up_flush(void);
 // The upload batch belongs only to the submit thread (the thread that called mtl_sub_begin): the batch's encoder cannot be used across threads. Every entry point asserts current thread == submit thread,
 // and on mismatch prints the stack and aborts on the spot - so that 'another thread touched the batch' is exposed deterministically on Mac too, not by timing (real iOS device stuck at the main menu: the present thread flushed the submit thread's batch via q_cb).
@@ -639,8 +669,8 @@ static void up_owner_check(const char *where) {
 // other threads (the present thread etc.) creating a command buffer do not touch the batch: they do not read or write textures uploaded in this batch; commands that need these textures all come after this replay submission (the batch is flushed before it)
 // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
-static void up_wait_zero(_Atomic int *v);
-static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending); } return [g_q commandBuffer]; }
+static void up_wait_zero(_Atomic int *v, int site);
+static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending, WS_OLDQ); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
 // One autorelease pool per submission: submissions run on a guest thread (long-lived, no run loop, never drains the implicit pool), so objects autoreleased in the Metal replay
 // (command buffers, encoders, pass descriptors, etc.) are never released unless put in a pool. Measured on the character select screen of a real iOS device: the host heap grows by about 47 objects per frame, 0.22 MiB/s.
@@ -667,7 +697,7 @@ void mtl_sub_begin(void) {
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("failed to create a new MTL4CommandAllocator: %s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
-    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); }
+    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
     g_alloc_cur = alloc_i;
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
@@ -679,7 +709,7 @@ void mtl_sub_begin(void) {
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
     if (pick < 0 && g_vis_ring_n < VIS_RING) pick = g_vis_ring_n++;
-    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < VIS_RING; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait(oldest, UINT64_MAX); }
+    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < VIS_RING; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait_at(oldest, UINT64_MAX, WS_VIS); }
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf;
@@ -1299,6 +1329,7 @@ uint64_t mtl_sub_commit(void) {
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        if (ws_on()) { unsigned fk = fence % 64; g_fend[fk].gpu_end = cb.GPUEndTime; g_fend[fk].fb = CACurrentMediaTime(); atomic_store(&g_fend[fk].fence, fence); }
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         for (int i = 0; i < n; i++) {
@@ -1332,7 +1363,9 @@ uint64_t mtl_sub_commit(void) {
 uint64_t mtl_last_fence(void) { return g_fence; }
 int mtl_last_commit_error(void) { return atomic_load(&g_last_commit_error); }
 
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site) {
+    if (g_done >= fence) { if (ws_on()) ws_put(site, 0, 0); return 1; }
+    uint64_t w0 = ws_t0();
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
     dl.tv_sec += ns / 1000000000ull; dl.tv_nsec = ns % 1000000000ull;
@@ -1341,18 +1374,19 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     while (g_done < fence) if ((r = pthread_cond_timedwait(&g_cv, &g_mu, &dl))) break;
     int ok = g_done >= fence;
     pthread_mutex_unlock(&g_mu);
+    if (ws_on()) { ws_put(site, w0, 1); if (site == WS_SYNC_NEWEST || site == WS_SYNC || site == WS_ACQ) ws_wake(fence); }
     return ok;
 }
+// The game's SyncWait (hle_nvn.c), with what it waits for in the wait ledger
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) { return mtl_wait_at(fence, timeout_ns, !timeout_ns ? WS_SYNC_POLL : fence >= g_fence ? WS_SYNC_NEWEST : WS_SYNC); }
+int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait_at(fence, timeout_ns, !timeout_ns ? WS_SYNC_POLL : WS_ACQ); }
 
-static void mtl_finish_gpu(void) {
-    if (g_fence) mtl_wait(g_fence, UINT64_MAX);
-    up_wait_zero(&g_up_pending);
+static void mtl_finish_gpu_at(int site) {
+    if (g_fence) mtl_wait_at(g_fence, UINT64_MAX, site);
+    up_wait_zero(&g_up_pending, site);
 }
-void mtl_present_flush(void);
-// nvnQueueFinish waits for the GPU work submitted so far, not for queued presents to reach the screen: with a window, the display link takes one present per tick, so waiting for them
-// made every QueueFinish cost one or two display frames. Fire Emblem: Three Houses' loader submits a copy and calls QueueFinish for each resource it uploads, and its first loading screen
-// took 78 s on the iPhone (5 s windowless on the Mac). A swapchain texture is not handed back before its previous present is processed (AcquireTexture waits for that ticket)
-void mtl_finish(void) { mtl_finish_gpu(); }
+#define mtl_finish_gpu() mtl_finish_gpu_at(WS_DIAG)
+void mtl_finish(void) { mtl_finish_gpu_at(WS_FINISH); }
 static void present_drop_for_suspend(void);
 void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init(); id<MTLCommandBuffer> cb = q_cb(); [cb commit]; [cb waitUntilCompleted]; mtl_finish_gpu(); }
 
@@ -1634,11 +1668,13 @@ static _Atomic int g_up_alloc_busy[3];
 // Three Houses' loader calls QueueFinish after each resource, each one waited up to a millisecond late). The 10 ms timeout is only a safety net
 static pthread_mutex_t g_up_wmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_up_wcv = PTHREAD_COND_INITIALIZER;
 static void up_wake(void) { pthread_mutex_lock(&g_up_wmu); pthread_cond_broadcast(&g_up_wcv); pthread_mutex_unlock(&g_up_wmu); }
-static void up_wait_zero(_Atomic int *v) {
-    if (!atomic_load(v)) return;
+static void up_wait_zero(_Atomic int *v, int site) {
+    if (!atomic_load(v)) { if (ws_on()) ws_put(site, 0, 0); return; }
+    uint64_t w0 = ws_t0();
     pthread_mutex_lock(&g_up_wmu);
     while (atomic_load(v)) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 10000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } pthread_cond_timedwait(&g_up_wcv, &g_up_wmu, &dl); }
     pthread_mutex_unlock(&g_up_wmu);
+    if (ws_on()) ws_put(site, w0, 1);
 }
 static unsigned g_up_seq;
 #define UP_BLOCK_SIZE (32u * 1024u * 1024u)
@@ -1721,7 +1757,7 @@ static void up_begin(void) {
     // waiting without handing it over waited for a batch never committed. Little Nightmares II's first render passes zero-filled enough new targets to come round to a slot within one
     // block, and its RHI thread waited for good inside nvnQueueSubmitCommands (q_cb drains before it waits for the same reason)
     if (atomic_load(&g_up_alloc_busy[slot])) rec_publish();
-    up_wait_zero(&g_up_alloc_busy[slot]);
+    up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
     atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
     [g_up_alloc4[slot] reset];
     g_up_cb = [g_dev newCommandBuffer];
@@ -2346,7 +2382,7 @@ static int pg_on(void) {
 }
 static void pg_sub_begin(uint64_t fence) {   // This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
     if (!pg_on()) return;
-    if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
+    if (fence > PG_RING) mtl_wait_at(fence - PG_RING, UINT64_MAX, WS_PG);
     g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
 }
 static pg_pass *pg_new(int kind, int nslot) {
@@ -7382,7 +7418,8 @@ static void mdi_wait(void) {
     rec_commit(g_cb, nil);
     if (!g_mdi_ev) g_mdi_ev = [g_dev newSharedEvent];
     rec_signal(g_mdi_ev, ++g_mdi_v); rec_drain();
-    if (![g_mdi_ev waitUntilSignaledValue:g_mdi_v timeoutMS:10000]) RED_ONCE(97, "indirect-count multi-draw: the GPU did not finish within 10 s; the count is read anyway");
+    uint64_t w0 = ws_t0(); int ok = [g_mdi_ev waitUntilSignaledValue:g_mdi_v timeoutMS:10000]; if (ws_on()) ws_put(WS_MDI, w0, 1);
+    if (!ok) RED_ONCE(97, "indirect-count multi-draw: the GPU did not finish within 10 s; the count is read anyway");
     g_cb = rec_cb_new();
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
     if (!g_mdi_waits++) MLOG("indirect-count multi-draw: first wait for the GPU-written count at frame %llu pass %llu", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass);
@@ -8143,7 +8180,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
     id<MTLTexture> mt = tex_mtl(t);
     if (!mt) { memset(dst, 0, img * nz); return; }
-    mtl_finish_gpu();
+    mtl_finish_gpu_at(WS_READTEX);
     id<MTLBuffer> buf = [g_dev newBufferWithLength:wb * hb * nz options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
     for (int z = 0; z < nz; z++)
@@ -9276,10 +9313,11 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val; } pq_item;   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; } pq_item;   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
 // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
 static id<MTLSharedEvent> g_ext_ev;
 static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
+static void snap_commit_wait(uint64_t v);
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
@@ -9335,7 +9373,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
-    ext_wait(it.ev_val);
+    ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
@@ -9445,7 +9483,7 @@ static void *present_main(void *arg) {
         uint64_t ticket = ++g_pq_read; g_classic_busy = 1;
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
-        ext_wait(it.ev_val);
+        ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
         @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
@@ -9480,39 +9518,55 @@ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_v
     if (ev && !g_ext_ev) g_ext_ev = (__bridge id<MTLSharedEvent>)ev;
     return present_enqueue(&t, period, crop, ev ? ev_val : 0);
 }
-// Present snapshots (Mac, DM_PRESENT_SNAP=1). A game with two swapchain textures (Breath of the Wild) gets one back only when the display link has taken its previous present on a
+// Present snapshots (DM_PRESENT_SNAP). A game with two swapchain textures (Breath of the Wild) gets one back only when the display link has taken its previous present on a
 // tick, so the next frame's CPU work starts on the tick and the GPU idles from the end of one frame to the first work of the next. macOS reads that idle time as room and holds the GPU
 // at its lowest clock (444 MHz on an M2 Max) even while frames miss the screen, and there 12 ms of GPU work a frame plus the time to the frame's first submission often missed 16.7 ms.
-// With snapshots each present is copied on the game's queue, right after the frame's work, into a texture of the host's own (a ring of SNAP_N), the display link shows the copy, and
+// With snapshots each present is copied on the game's queue, right after the frame's work, into a texture of the host's own (a ring of g_snap_n), the display link shows the copy, and
 // the game's texture is free at once: the game runs up to a frame ahead of the screen, and a frame whose GPU work runs long is absorbed instead of shown late. A ring slot is reused
 // once its present has been processed; the presenting thread's wait for it paces the game (mtl_snap_take_wait: the frame step counts it as waiting, not as the frame's cost)
-#define SNAP_N 2
-static struct { id<MTLTexture> tex; uint64_t serial, ticket, ev; } g_snap[SNAP_N];
-static id<MTL4CommandAllocator> g_snap_alloc[SNAP_N]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_N];
+// With Metal encoding on its own thread (DM_NVN_ENC_THREAD) the copy is a block of the encode thread's queue (rec_own_push): it runs behind everything the game submitted before
+// the present, the presenting thread does not wait for the encode thread, and the frame's present waits only until that block is encoded (snap_commit_wait), before its blit.
+// The ring's length is the number of frames the game may run ahead of the screen: DM_PRESENT_SNAP=<n> (2 to SNAP_MAX; 1 = 2). On by default on iOS (DM_PRESENT_SNAP=0 turns them off)
+#define SNAP_MAX 4
+static struct { id<MTLTexture> tex; uint64_t serial, ticket, ev; } g_snap[SNAP_MAX];
+static id<MTL4CommandAllocator> g_snap_alloc[SNAP_MAX]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_MAX];
 static id<MTLResidencySet> g_snap_res; static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v, g_snap_next;
-static _Atomic uint64_t g_snap_wait_ns;
-int mtl_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_SNAP"); v = e && atoi(e) > 0; if (v) MLOG("present snapshots (DM_PRESENT_SNAP=1): each present is copied into a host texture and the game's texture is free at once"); } return v; }
+static _Atomic uint64_t g_snap_wait_ns, g_snap_cmt;   // g_snap_cmt: the last copy the encode thread has committed (its g_snap_v)
+static int g_snap_n = 2;
+int mtl_snap_on(void) {
+    static int v = -1; if (v >= 0) return v;
+    const char *e = getenv("DM_PRESENT_SNAP");
+#if TARGET_OS_IPHONE
+    int n = e ? atoi(e) : 1;
+#else
+    int n = e ? atoi(e) : 0;
+#endif
+    v = n > 0; g_snap_n = n < 2 ? 2 : n > SNAP_MAX ? SNAP_MAX : n;
+    if (v) MLOG("present snapshots (DM_PRESENT_SNAP=%d): each present is copied into a ring of %d host textures and the game's texture is free at once", n, g_snap_n);
+    return v;
+}
 uint64_t mtl_snap_take_wait(void) { return atomic_exchange(&g_snap_wait_ns, 0); }
+static void snap_commit_wait(uint64_t v) { if (v) rec_note_wait(&g_snap_cmt, v); }
 // Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before)
 static uint64_t snap_take(const tex_t *t) {
-    // With the encoding thread (DM_NVN_ENC_THREAD, the default on iOS) the frame's work may still sit in its record queue when another thread presents (Breath of the Wild's
-    // Presentation Thread): a copy committed now would run before it, and a GPU wait for the frame's fence would hold the queue in front of that very commit. Such a frame is presented as before
-    if (rec_on() && !on_sub_thread()) { static int once; if (!once++) MLOG("present snapshots: off for presents from another thread while Metal encoding runs on its own thread (DM_NVN_ENC_THREAD)"); return 0; }
     id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
     if (!g_snap_ev) {
         g_snap_ev = [g_dev newSharedEvent];
-        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new]; rd.initialCapacity = SNAP_N; NSError *e = nil;
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new]; rd.initialCapacity = SNAP_MAX; NSError *e = nil;
         g_snap_res = [g_dev newResidencySetWithDescriptor:rd error:&e]; if (!g_snap_res) MDIE("present snapshots: no residency set: %s", e.localizedDescription.UTF8String);
         [g_q4 addResidencySet:g_snap_res];
-        for (int i = 0; i < SNAP_N; i++) {
+        for (int i = 0; i < g_snap_n; i++) {
             g_snap_alloc[i] = [g_dev newCommandAllocator]; g_snap_cb[i] = [g_dev newCommandBuffer];
             if (!g_snap_alloc[i] || !g_snap_cb[i]) MDIE("present snapshots: no command allocator / buffer");
         }
     }
-    int k = (int)(g_snap_next++ % SNAP_N);
+    int k = (int)(g_snap_next++ % (uint64_t)g_snap_n);
     uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (g_snap[k].ticket) mtl_present_wait(g_snap[k].ticket);   // its last present has been processed: the display's blit from it is on the queue before this copy
-    if (g_snap[k].ev && ![g_snap_ev waitUntilSignaledValue:g_snap[k].ev timeoutMS:2000]) RED_ONCE(111, "present snapshots: the previous copy into a ring slot did not finish within 2 s");
+    // The slot's last present has been processed (its blit is committed, and the copy below runs after it on the queue): this wait is the ring's pacing, a wait for the screen.
+    // Its allocator: the copy committed from it has completed (it ran before that blit, which has been taken), so the reset below is safe without a wait of its own in nearly every frame
+    if (g_snap[k].ticket) mtl_present_wait(g_snap[k].ticket);
+    if (ws_on()) ws_put(WS_SNAP, w0, 1);
+    if (g_snap[k].ev && g_snap_ev.signaledValue < g_snap[k].ev && ![g_snap_ev waitUntilSignaledValue:g_snap[k].ev timeoutMS:2000]) RED_ONCE(111, "present snapshots: the previous copy into a ring slot did not finish within 2 s");
     atomic_fetch_add(&g_snap_wait_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0);
     id<MTLTexture> dst = g_snap[k].tex;
     if (!dst || dst.width != src.width || dst.height != src.height || dst.pixelFormat != src.pixelFormat) {
@@ -9529,11 +9583,23 @@ static uint64_t snap_take(const tex_t *t) {
     id<MTL4CommandBuffer> cb = g_snap_cb[k];
     [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // after the frame's work and the slot's last blit to the screen
     [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // the game's next writes to its texture come after the copy
     [ce endEncoding]; [cb endCommandBuffer];
-    if (on_sub_thread()) rec_drain();   // after everything the encoding thread still holds of the frame (presents from the submitting thread)
-    [g_q4 commit:&cb count:1];
-    g_snap[k].ev = ++g_snap_v; [g_q4 signalEvent:g_snap_ev value:g_snap[k].ev];
+    uint64_t v = ++g_snap_v;
+    if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (see above)
+        if (on_sub_thread()) rec_publish();   // what the submitting thread recorded outside a submission goes first
+        rec_blk *b = rec_own_begin();
+        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = 0; r->a[1] = rec_obj(cb);
+        r = rec_own_put(b, RO_SIGNAL, 1); r->a[0] = rec_obj(g_snap_ev); r->a[1] = v;
+        r = rec_own_put(b, RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_snap_cmt; r->a[1] = v;
+        rec_own_push(b);
+    } else {
+        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1]; [g_q4 signalEvent:g_snap_ev value:v]; pthread_mutex_unlock(&g_res_mu);
+        atomic_store(&g_snap_cmt, v);
+    }
+    g_snap[k].ev = v;
     return g_snap[k].serial;
 }
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
@@ -9547,11 +9613,12 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         if (st == 1 && link_on() && now - t0 >= at) { st = 2; mtl_link_pause(1); MLOG("DM_TEST_LINK_STALL: pausing the display link for %.1f s (frame %llu)", dur, (unsigned long long)atomic_load(&g_cur_frame)); }
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
-    tex_t snap; uint64_t ss = 0; int slot = (int)(g_snap_next % SNAP_N);
+    if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+    tex_t snap; uint64_t ss = 0; int slot = (int)(g_snap_next % (uint64_t)g_snap_n);
     if (t && !ev_val && mtl_snap_on() && (ss = snap_take(t))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     if (ss) g_snap[slot].ticket = tk;
