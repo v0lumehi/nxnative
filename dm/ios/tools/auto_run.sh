@@ -22,18 +22,22 @@ TOOLS="$(cd "$(dirname "$0")/../../tools" && pwd)"
 [ -f "$ENVF" ] || die "no env file $ENVF"; [ -n "$ROUTE" ] && [ -f "$ROUTE" ] || die "no route file (--route or DM_AUTO_ROUTE)"
 mkdir -p "$R"; L="$R/auto.log"; : > "$L"
 say() { echo "$(date +%T) $*" | tee -a "$L"; }
-dc() { xcrun devicectl "$@" --device "$D" >> "$L" 2>&1; }
+dc() { local a=$1 b=$2 c=$3; shift 3; xcrun devicectl "$a" "$b" "$c" --device "$D" "$@" >> "$L" 2>&1; }   # three command words, then the device, then the rest (launch takes the bundle ID last)
 put() { dc device copy to --domain-type appDataContainer --domain-identifier "$BID" --source "$1" --destination "Documents/$2"; }
 get() { dc device copy from --domain-type appDataContainer --domain-identifier "$BID" --source "Documents/$1" --destination "$2"; }
+app_url() {   # where this bundle is installed: other apps on the device may have an executable of the same name (DmIOS)
+    xcrun devicectl device info apps --device "$D" --bundle-id "$BID" --json-output "$R/.apps.json" >/dev/null 2>&1
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["apps"][0]["url"])' "$R/.apps.json" 2>/dev/null; }
 running_pid() { xcrun devicectl device info processes --device "$D" --json-output "$R/.ps.json" >/dev/null 2>&1
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((str(p["processIdentifier"]) for p in d["result"]["runningProcesses"] if p.get("executable","").endswith("/DmIOS")), ""))' "$R/.ps.json" 2>/dev/null; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((str(p["processIdentifier"]) for p in d["result"]["runningProcesses"] if p.get("executable","").startswith(sys.argv[2])), ""))' "$R/.ps.json" "$APPURL" 2>/dev/null; }
 others_busy() { pgrep -f "xctrace record" >/dev/null || pgrep -f "devicectl device (install|process launch)" >/dev/null; }
 # --- the phone is shared: wait for the lock and for other recordings / installs, then hold the lock
 if [ -n "$LOCK" ]; then
     n=0; while [ -e "$LOCK" ] || others_busy; do [ $((n % 12)) = 0 ] && say "waiting for the phone ($(cat "$LOCK" 2>/dev/null || echo 'another xctrace / devicectl run'))"; n=$((n + 1)); sleep 5; done
     echo "ios-auto $NAME $(date +%T)" > "$LOCK"; trap 'rm -f "$LOCK"' EXIT INT TERM
 fi
-dc device info details || die "device $D not reachable"
+xcrun devicectl device info details --device "$D" >> "$L" 2>&1 || die "device $D not reachable"
+APPURL=$(app_url); [ -n "$APPURL" ] || die "$BID is not installed on $D"
 [ -z "$(running_pid)" ] || die "the app is already running on the device (someone is playing?)"
 # --- push the env, the route, the save snapshot
 get env.txt "$R/env.device.txt" || : > "$R/env.device.txt"
@@ -60,7 +64,7 @@ done
 if [ $steady = 1 ]; then
     say "steady part reached after $(( $(date +%s) - t0 )) s"
     if [ $TRACE = 1 ]; then
-        dc device info details
+        xcrun devicectl device info details --device "$D" >> "$L" 2>&1   # the device "connected" for xctrace
         INST=(--template 'Metal System Trace'); [ $COUNTERS = 1 ] && INST+=(--instrument 'Metal GPU Counters')
         say "recording ${SECS} s (${INST[*]})"
         xcrun xctrace record "${INST[@]}" --device "$D" --all-processes --time-limit "${SECS}s" --no-prompt --output "$R/trace.trace" >> "$L" 2>&1 || say "[RED] xctrace exited $?"

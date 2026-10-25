@@ -107,10 +107,11 @@ def timeline(rows, lo, hi):
 
 # ---------- Instruments recording ----------
 def xexport(trace, schema):
-    cache = os.path.join(trace, f'_export_{schema}.xml')
-    if not os.path.exists(cache):
+    cache = f'{trace.rstrip("/")}.{schema}.xml'   # beside the recording: a file written into the bundle while xctrace reads it made the export come back empty
+    if not os.path.exists(cache) or not os.path.getsize(cache):
         with open(cache + '.tmp', 'wb') as o:
-            subprocess.run(['xcrun', 'xctrace', 'export', '--input', trace, '--xpath', f'/trace-toc/run[@number="1"]/data/table[@schema="{schema}"]'], stdout=o, stderr=subprocess.DEVNULL, check=False)
+            r = subprocess.run(['xcrun', 'xctrace', 'export', '--input', trace, '--xpath', f'/trace-toc/run[@number="1"]/data/table[@schema="{schema}"]'], stdout=o, stderr=subprocess.PIPE, check=False)
+        if r.returncode or not os.path.getsize(cache + '.tmp'): print(f'[RED] xctrace export {schema}: {r.stderr.decode(errors="replace").strip()[:300]}', file=sys.stderr)
         os.replace(cache + '.tmp', cache)
     return cache
 
@@ -136,26 +137,31 @@ def union(iv):
     return tot + (ce - cs if cs is not None else 0)
 
 
-def trace_gpu(trace):
-    frames = collections.defaultdict(lambda: collections.defaultdict(list))
+def trace_gpu(trace, proc='DmIOS'):
+    """The game's GPU channel intervals over the whole recording: busy time per channel (union of intervals), vertex / fragment overlap, idle, and the idle gaps."""
+    ch = collections.defaultdict(list)
     for c in xrows(xexport(trace, 'metal-gpu-intervals')):
-        try: start, dur, ch, fr = int(c[0].text), int(c[1].text), c[2].get('fmt', c[2].text or ''), c[3].text
+        p = next((x.get('fmt', '') for x in c if x.tag == 'process'), '')
+        if p and proc not in p: continue
+        try: start, dur, name = int(c[0].text), int(c[1].text), c[2].get('fmt', c[2].text or '')
         except (AttributeError, ValueError, IndexError, TypeError): continue
-        frames[fr][ch].append((start, start + dur))
-    per = []
-    for fr, chs in frames.items():
-        allv = [iv for v in chs.values() for iv in v]
-        if len(allv) < 20: continue   # the compositor's and other processes' small frames
-        span = max(e for s, e in allv) - min(s for s, e in allv)
-        V, F, C = chs.get('Vertex', []), chs.get('Fragment', []), chs.get('Compute', [])
-        uv, uf, uc, ua = union(V), union(F), union(C), union(allv)
-        per.append({'span': span / 1e6, 'vertex': uv / 1e6, 'fragment': uf / 1e6, 'compute': uc / 1e6, 'busy': ua / 1e6,
-                    'vf_overlap': (uv + uf - union(V + F)) / 1e6, 'idle': (span - ua) / 1e6})
+        ch[name].append((start, start + dur))
+    allv = [iv for v in ch.values() for iv in v]
+    if not allv: return None, collections.Counter()
+    t0, t1 = min(s for s, e in allv), max(e for s, e in allv)
+    V, F, C = ch.get('Vertex', []), ch.get('Fragment', []), ch.get('Compute', [])
+    uv, uf, uc, ua = union(V), union(F), union(C), union(allv)
+    gaps, ce = [], None
+    for s, e in sorted(allv):
+        if ce is not None and s > ce: gaps.append(s - ce)
+        ce = e if ce is None else max(ce, e)
+    res = {'window_s': (t1 - t0) / 1e9, 'vertex': uv, 'fragment': uf, 'compute': uc, 'busy': ua, 'vf_overlap': uv + uf - union(V + F),
+           'vertex_only': union(V + F) - uf, 'idle': (t1 - t0) - ua, 'gaps_over_1ms': sum(g for g in gaps if g > 1e6), 'n_gaps_over_1ms': sum(1 for g in gaps if g > 1e6)}
     states = collections.Counter()
     for c in xrows(xexport(trace, 'gpu-performance-state-intervals')):
         try: states[(c[2].get('fmt'), c[4].get('fmt'))] += int(c[1].text)
         except (AttributeError, ValueError, IndexError, TypeError): pass
-    return per, states
+    return res, states
 
 
 def trace_threads(trace, proc='DmIOS'):
@@ -235,10 +241,12 @@ def main():
     if a.trace:
         per, states = trace_gpu(a.trace)
         if per:
-            print(f'\nInstruments GPU frames ({len(per)}; ms):')
-            for k in ('span', 'busy', 'vertex', 'fragment', 'compute', 'vf_overlap', 'idle'):
-                s = stats([p[k] for p in per]); out.setdefault('trace_gpu', {})[k] = s
-                print(f'  {k:12s} mean {s["mean"]:6.2f}  p50 {s["p50"]:6.2f}  p90 {s["p90"]:6.2f}')
+            fps = 1000 / statistics.fmean([d['period'] for d in tl if d['period']]); nf = per['window_s'] * fps
+            print(f'\nInstruments GPU, the game\'s intervals ({per["window_s"]:.1f} s, ms per frame at {fps:.1f} fps; busy = union of the channel\'s intervals):')
+            for k in ('busy', 'vertex', 'fragment', 'compute', 'vf_overlap', 'vertex_only', 'idle', 'gaps_over_1ms'):
+                print(f'  {k:14s} {per[k] / 1e6 / nf:7.2f}')
+            print(f'  idle gaps over 1 ms: {per["n_gaps_over_1ms"] / nf:.2f} per frame')
+            out['trace_gpu'] = {k: (v / 1e6 / nf if k not in ('window_s', 'n_gaps_over_1ms') else v) for k, v in per.items()}
         if states:
             tot = sum(states.values())
             print('  GPU performance state: ' + ', '.join(f'{s} ({"induced" if ind == "Yes" else "not induced"}) {100 * v / tot:.0f}%' for (s, ind), v in states.most_common()))
