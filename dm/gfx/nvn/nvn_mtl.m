@@ -4488,8 +4488,8 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
 // taken from an archive costs about 0.06 ms, against 10-80 ms to build one.
 // DM_PSO_MTL4=0: the MTLDevice path as before (no bases, no archive). DM_PSO_ARCHIVE=off: no archive; DM_PSO_ARCHIVE=<folder>: the archive in that folder.
 // On by default on the Mac; on iOS DM_PSO_MTL4=1, or the profile key pso_mtl4 on, turns it on, and with it the hybrid pipelines and the pipeline prebuild. The archive's footprint
-// (with the prebuild, about 850 MB more for Breath of the Wild) is not measured against an iPhone's limit yet, and an iPhone cannot be given an archive made offline (metal-tt
-// rejects the Metal 4 serializer's pipeline script)
+// (with the prebuild, about 850 MB more for Breath of the Wild) is not measured against an iPhone's limit yet. The prebuild's bases can also come made offline, bundled with the
+// app (DM_PSO_BUNDLE, pso_bundle_open)
 static int pso4_on(void) {
     static int v = -1;
     if (v < 0) {
@@ -4531,6 +4531,38 @@ static nvn_hmap g_pbase = {.klen = sizeof(pbase_key)};
 static nvn_hmap g_pbase_pending = {.klen = sizeof(pbase_key)};
 static os_unfair_lock g_pbase_lock = OS_UNFAIR_LOCK_INIT;
 static NSString *pso_user_path(void);
+// The pipeline archive made offline (dm/gfx/tools/pso_offline.py, metal-tt) and bundled with the app: DM_PSO_BUNDLE=<folder> (the iOS app sets it to its pso/ folder when it has one;
+// off: not used) holds <GPU architecture>.mtl4a per architecture it was built for and prebuilt.tsv, what it covers (pso_prebuild). The file named after this device's architecture is
+// opened read only and looked up first among the files of bases without a vertex layout; it is never written or compacted. A system that cannot open it (one older than the archive's
+// minimum, or an OS update that changed the GPU compiler) or a GPU it was not built for gets an info line, and the device builds the bases itself as before
+static id<MTL4Archive> g_arch_bundle; static NSString *g_bundle_dir;
+// A file newArchiveWithURL may be given: it starts as a pipeline archive does, a Mach-O image (the Metal 4 serializer's, metal-tt's for one GPU) or a universal one (metal-tt's for
+// several, or a serializer's on some systems). Metal itself crashed (MTL4ArchiveImpl::loadFromURL) on a text file, and on a bare Mach-O header: only the start can be checked
+static int arch_file_ok(NSString *path) {
+    uint8_t m[4] = {0}; int fd = open(path.fileSystemRepresentation, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, m, 4) : -1; if (fd >= 0) close(fd);
+    static const uint8_t ok[][4] = {{0xcf, 0xfa, 0xed, 0xfe}, {0xcb, 0xfe, 0xba, 0xbe}, {0xca, 0xfe, 0xba, 0xbe}, {0xca, 0xfe, 0xba, 0xbf}};
+    for (unsigned i = 0; n == 4 && i < sizeof ok / sizeof ok[0]; i++) if (!memcmp(m, ok[i], 4)) return 1;
+    return 0;
+}
+static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
+    const char *e = getenv("DM_PSO_BUNDLE");
+    if (!e || !*e || !strcmp(e, "off")) return;
+    NSString *dir = @(e), *gpu = [(id)g_dev respondsToSelector:@selector(architecture)] ? g_dev.architecture.name : nil;
+    NSString *p = gpu ? [dir stringByAppendingPathComponent:[gpu stringByAppendingPathExtension:@"mtl4a"]] : nil;
+    if (!p || ![NSFileManager.defaultManager fileExistsAtPath:p]) {
+        NSArray<NSString *> *have = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]];
+        MLOG("pipeline archive bundled with the app: none for this GPU (%s; %s has %s): the bases are built on the device", gpu ? gpu.UTF8String : "architecture unknown", e,
+             have.count ? [have componentsJoinedByString:@", "].UTF8String : "none");
+        return;
+    }
+    uint64_t t0 = bp_now(); NSError *ae = nil;
+    if (!arch_file_ok(p)) { MLOG("[RED] pipeline archive bundled with the app: %s is not a pipeline archive: the bases are built on the device", p.UTF8String); return; }
+    id<MTL4Archive> a = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae];
+    if (!a) { MLOG("pipeline archive bundled with the app: this system cannot open %s (%s; made for another system version, or an OS update changed the GPU compiler): the bases are built on the device",
+                   p.UTF8String, ae.localizedDescription.UTF8String); return; }
+    g_arch_bundle = a; g_bundle_dir = dir; [archp addObject:a];
+    MLOG("pipeline archive bundled with the app: %s, %.1f MB, opened in %.1f ms", p.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
+}
 static void pso4_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -4538,27 +4570,29 @@ static void pso4_init(void) {
         const char *e = getenv("DM_PSO_ARCHIVE"); NSString *user = pso_user_path();
         g_arch_dir = e && !strcmp(e, "off") ? nil : e && *e ? @(e) : user ? [user.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_archive"] : nil;
         id<MTL4PipelineDataSetSerializer> ser = nil;
+        NSMutableArray<id<MTL4Archive>> *arch = [NSMutableArray array], *archp = [NSMutableArray array];
+        pso_bundle_open(archp);   // first: it holds every pair's base
         if (g_arch_dir) {
             g_arch_q = dispatch_queue_create("dm.nvn.pso-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
             MTL4PipelineDataSetSerializerDescriptor *sd = [MTL4PipelineDataSetSerializerDescriptor new]; sd.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
             ser = [g_dev newPipelineDataSetSerializerWithDescriptor:sd];
-            NSMutableArray<id<MTL4Archive>> *arch = [NSMutableArray array], *archp = [NSMutableArray array]; uint64_t t0 = bp_now(); unsigned long long bytes = 0;
+            uint64_t t0 = bp_now(); unsigned long long bytes = 0;
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]]
                                           sortedArrayUsingSelector:@selector(compare:)];
             for (NSString *n in names.reverseObjectEnumerator) {   // newest first
                 NSString *p = [g_arch_dir stringByAppendingPathComponent:n]; NSError *ae = nil;
-                id<MTL4Archive> a = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae];
+                id<MTL4Archive> a = arch_file_ok(p) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae] : nil;
                 int pf = [n hasPrefix:@"p"];
                 if (a) { [pf ? archp : arch addObject:a]; if (!pf) [runf addObject:p]; bytes += [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize]; }
-                else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae.localizedDescription.UTF8String);
+                else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
                 g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
             }
-            g_arch4 = arch; g_arch4p = archp;
             if (runf.count > PSO_ARCH_COMPACT) { g_compact_opts = [MTL4CompilerTaskOptions new]; g_compact_opts.lookupArchives = arch; g_compact_files = runf; }
-            MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count),
-                 (unsigned long)archp.count, bytes / 1048576.0, (bp_now() - t0) / 1e6);
+            MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count - (g_arch_bundle != nil)),
+                 (unsigned long)archp.count - (g_arch_bundle != nil), bytes / 1048576.0, (bp_now() - t0) / 1e6);
         }
+        g_arch4 = arch; g_arch4p = archp;
         MTL4CompilerDescriptor *cd = [MTL4CompilerDescriptor new]; cd.pipelineDataSetSerializer = ser;
         NSError *ce = nil; g_comp4 = [g_dev newCompilerWithDescriptor:cd error:&ce];
         if (!g_comp4) MLOG("[RED] no Metal 4 compiler (%s): render pipelines are built through the MTLDevice", ce.localizedDescription.UTF8String);
@@ -4867,7 +4901,8 @@ void mtl_pso_line(char *o, size_t n) {
 // there (the archive matches libraries by content). Bases already in the archive are skipped; what is built goes into the archive, flushed every 1,000 bases (the serializer holds
 // what it captured until then). Runs once per chain version, depth mode and pair list (pso_archive/prebuilt.tsv): in the app after the prewarm, on a background queue at utility QoS
 // (DM_PSO_PREBUILD=0: not at all), or as a tool on the Mac (DM_PSO_PREBUILD=tool: build, write, exit). Vertex shaders that write the layer, pairs whose vertex shader has stage
-// inputs but no pulling library, and integer-output or multisampled bases are left to the draws
+// inputs but no pulling library, and integer-output or multisampled bases are left to the draws. An app that bundles these bases made offline (DM_PSO_BUNDLE, pso_bundle_covers)
+// builds none of them, only the pairs that archive left to the device (rest_pairs.tsv beside it: functions with constants)
 static _Atomic int g_pre_running; static _Atomic int g_pre_done, g_pre_built, g_pre_archived, g_pre_skipped, g_pre_failed;
 static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // as shader_load notes them (fn4_note): constants specialized with an empty set
     id<MTLFunction> f = [lib newFunctionWithName:name]; if (!f) return nil;
@@ -4876,36 +4911,84 @@ static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   //
     MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = [MTLFunctionConstantValues new]; return sd;
 }
 static NSDictionary *pre_json(NSString *key) { NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]]; return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
+// The base of one pair as the draws make it (pso_desc_pull / pso_desc), or nil when the pair is left to the draws. Call inside an autorelease pool
+static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int zero) {
+    NSDictionary *vj = pre_json(vk), *fj = pre_json(fk);
+    if (!vj || !fj || ![vj[@"chain"] isEqual:@DMSH_CHAIN] || ![fj[@"chain"] isEqual:@DMSH_CHAIN]) return nil;
+    NSString *ventry = zero && vj[@"entry_z"] ? vj[@"entry_z"] : vj[@"entry"], *fentry = fj[@"entry"] ?: @"main0";
+    int pull = [vj[@"pull"] isKindOfClass:[NSDictionary class]];
+    if (!pull && [vj[@"vertex_inputs"] count]) return nil;   // stage inputs and no pulling library: its pipelines need the draw's layout
+    NSError *e = nil;
+    id<MTLLibrary> vl = lib_from_file([NSString stringWithFormat:@"%@/%@%@.metallib", g_msl_dir, vk, pull ? @"_bp" : @"_b"], &e);
+    if (!vl || t_lib_layer) return nil;   // writes the layer: its pipelines take an input primitive class (pso_desc), no pulling pipeline
+    id<MTLLibrary> fl = lib_from_file([NSString stringWithFormat:@"%@/%@_b.metallib", g_msl_dir, fk], &e);
+    MTL4FunctionDescriptor *vf = pre_fn(vl, ventry), *ff = fl ? pre_fn(fl, fentry) : nil;
+    if (!vf || !ff) return nil;
+    MTL4RenderPipelineDescriptor *m = [MTL4RenderPipelineDescriptor new];
+    m.vertexFunctionDescriptor = vf; m.fragmentFunctionDescriptor = ff; m.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor]; m.rasterSampleCount = 1;
+    for (int i = 0; i < 8; i++) { MTL4RenderPipelineColorAttachmentDescriptor *a = m.colorAttachments[i];
+        a.pixelFormat = MTLPixelFormatUnspecialized; a.writeMask = MTLColorWriteMaskUnspecialized; a.blendingState = MTL4BlendStateUnspecialized;
+        a.sourceRGBBlendFactor = a.destinationRGBBlendFactor = a.sourceAlphaBlendFactor = a.destinationAlphaBlendFactor = MTLBlendFactorUnspecialized;
+        a.rgbBlendOperation = a.alphaBlendOperation = MTLBlendOperationUnspecialized; }
+    return m;
+}
 static void pre_pair(NSString *vk, NSString *fk, int zero) {
     @autoreleasepool {
-        NSDictionary *vj = pre_json(vk), *fj = pre_json(fk);
-        if (!vj || !fj || ![vj[@"chain"] isEqual:@DMSH_CHAIN] || ![fj[@"chain"] isEqual:@DMSH_CHAIN]) { g_pre_skipped++; return; }
-        NSString *ventry = zero && vj[@"entry_z"] ? vj[@"entry_z"] : vj[@"entry"], *fentry = fj[@"entry"] ?: @"main0";
-        int pull = [vj[@"pull"] isKindOfClass:[NSDictionary class]];
-        if (!pull && [vj[@"vertex_inputs"] count]) { g_pre_skipped++; return; }   // stage inputs and no pulling library: its pipelines need the draw's layout
-        NSError *e = nil;
-        id<MTLLibrary> vl = lib_from_file([NSString stringWithFormat:@"%@/%@%@.metallib", g_msl_dir, vk, pull ? @"_bp" : @"_b"], &e);
-        if (!vl || t_lib_layer) { g_pre_skipped++; return; }   // writes the layer: its pipelines take an input primitive class (pso_desc), no pulling pipeline
-        id<MTLLibrary> fl = lib_from_file([NSString stringWithFormat:@"%@/%@_b.metallib", g_msl_dir, fk], &e);
-        MTL4FunctionDescriptor *vf = pre_fn(vl, ventry), *ff = fl ? pre_fn(fl, fentry) : nil;
-        if (!vf || !ff) { g_pre_skipped++; return; }
-        MTL4RenderPipelineDescriptor *m = [MTL4RenderPipelineDescriptor new];
-        m.vertexFunctionDescriptor = vf; m.fragmentFunctionDescriptor = ff; m.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor]; m.rasterSampleCount = 1;
-        for (int i = 0; i < 8; i++) { MTL4RenderPipelineColorAttachmentDescriptor *a = m.colorAttachments[i];
-            a.pixelFormat = MTLPixelFormatUnspecialized; a.writeMask = MTLColorWriteMaskUnspecialized; a.blendingState = MTL4BlendStateUnspecialized;
-            a.sourceRGBBlendFactor = a.destinationRGBBlendFactor = a.sourceAlphaBlendFactor = a.destinationAlphaBlendFactor = MTLBlendFactorUnspecialized;
-            a.rgbBlendOperation = a.alphaBlendOperation = MTLBlendOperationUnspecialized; }
+        MTL4RenderPipelineDescriptor *m = pre_desc(vk, fk, zero);
+        if (!m) { g_pre_skipped++; return; }
         for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
+        NSError *e = nil;
         pthread_rwlock_rdlock(&g_arch_rw); id ps = [g_comp4 newRenderPipelineStateWithDescriptor:m compilerTaskOptions:nil error:&e]; pthread_rwlock_unlock(&g_arch_rw);
         if (ps) { g_pre_built++; atomic_fetch_add(&g_arch_new, 1); }
         else { if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String); }
     }
 }
+// What a prebuild covers (prebuilt.tsv): the chain version, the depth mode, and the pair lists' length in bytes and SHA-256 (first 16 hex digits). dm/gfx/tools/pso_offline.py writes
+// the same for the archive it makes offline, from the same files
+static NSString *pre_stamp(NSString *txt, int zero) {
+    NSData *d = [txt dataUsingEncoding:NSUTF8StringEncoding]; uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
+    return [NSString stringWithFormat:@"chain\t%s\ndepth\t%s\npairs\t%lu\t%02x%02x%02x%02x%02x%02x%02x%02x\n", DMSH_CHAIN, zero ? "near=0" : "near=-w", (unsigned long)d.length,
+            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]];
+}
+static NSArray<NSArray<NSString *> *> *pre_parse(NSString *txt) {   // (vertex key, pixel key) per line, without empty lines, comments and repeated lines
+    NSMutableArray<NSArray<NSString *> *> *pairs = [NSMutableArray array]; NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *l in [txt componentsSeparatedByString:@"\n"]) { if (!l.length || [l hasPrefix:@"#"] || [seen containsObject:l]) continue; [seen addObject:l]; NSArray *c = [l componentsSeparatedByString:@"\t"]; if (c.count >= 2) [pairs addObject:c]; }
+    return pairs;
+}
+// Whether the archive bundled with the app (pso_bundle_open) holds this run's prebuild: its prebuilt.tsv is the stamp the device would write for these pairs and this depth mode,
+// and a probe of up to 16 pairs spread over the list (not those it left to the device, rest) finds every base it makes in it (an archive that opens but whose binaries this system
+// does not take finds none)
+enum { PRE_PROBE = 16 };
+static const char *stamp_line(NSString *st) {   // a stamp on one line, for the log
+    return [[[st stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@"; "] stringByReplacingOccurrencesOfString:@"\t" withString:@" "].UTF8String;
+}
+static int pso_bundle_covers(NSArray<NSArray<NSString *> *> *pairs, NSString *want, int zero, NSString *rest) {
+    NSString *have = [NSString stringWithContentsOfFile:[g_bundle_dir stringByAppendingPathComponent:@"prebuilt.tsv"] encoding:NSUTF8StringEncoding error:nil];
+    if (![have isEqualToString:want]) {
+        MLOG("pipeline archive bundled with the app: made for %s, this run needs %s: the device builds the bases it does not hold%s", have ? stamp_line(have) : "(no prebuilt.tsv)", stamp_line(want),
+             have && [have rangeOfString:zero ? @"depth\tnear=-w" : @"depth\tnear=0"].location != NSNotFound ? " (the game's depth mode is not the one built for: the profile key depth_mode)" : "");
+        return 0;
+    }
+    NSMutableSet<NSArray<NSString *> *> *left = [NSMutableSet setWithArray:pre_parse(rest ?: @"")];
+    NSMutableArray<NSArray<NSString *> *> *cand = [NSMutableArray array];
+    for (NSArray<NSString *> *p in pairs) if (![left containsObject:@[p[0], p[1]]]) [cand addObject:p];
+    uint64_t t0 = bp_now(); int probed = 0, found = 0; NSUInteger n = cand.count;
+    for (NSUInteger k = 0; k < PRE_PROBE && k < n; k++) @autoreleasepool {
+        NSArray<NSString *> *p = cand[k * n / MIN(n, (NSUInteger)PRE_PROBE)];
+        MTL4RenderPipelineDescriptor *m = pre_desc(p[0], p[1], zero);
+        if (!m) continue;
+        probed++; found += [g_arch_bundle newRenderPipelineStateWithDescriptor:m error:nil] != nil;
+    }
+    int ok = found == probed;
+    MLOG("pipeline archive bundled with the app: %s (%d of %d probed bases found, %.1f ms)%s", ok ? "holds the bases of every shader pair" : "this system does not take its bases",
+         found, probed, (bp_now() - t0) / 1e6, ok ? "" : ": the device builds them");
+    return ok;
+}
 // threads: workers; wait: run on the calling thread until done (the tool), else in the background. Returns the number of pairs, -1 when there is nothing to do
 static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     shmap_load(); pso4_init();
-    if (!g_comp4 || !g_ser4 || !g_arch_dir || atomic_exchange(&g_pre_running, 1)) return -1;
+    if (!g_comp4 || (!g_arch_bundle && (!g_ser4 || !g_arch_dir)) || atomic_exchange(&g_pre_running, 1)) return -1;
     // The pairs: shader_pairs.tsv (BNSH variations and the other readers' pairs) and pso_pairs.tsv (agl BAHS program variations, which vs_pad does not read; DM_PSO_PAIRS: another path),
     // both beside the shader map
     NSString *pp = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"shader_pairs.tsv"];
@@ -4915,12 +4998,16 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     if (!txt) { MLOG("pipeline prebuild: no %s, nothing to build", pp.UTF8String); g_pre_running = 0; return -1; }
     if (txt2) txt = [txt stringByAppendingString:txt2];
     int zero = atomic_load(&g_depth_zero);
+    NSString *want = pre_stamp(txt, zero);
+    NSArray<NSArray<NSString *> *> *pairs = pre_parse(txt);
+    NSString *rp = g_arch_bundle ? [g_bundle_dir stringByAppendingPathComponent:@"rest_pairs.tsv"] : nil, *rest = rp ? [NSString stringWithContentsOfFile:rp encoding:NSUTF8StringEncoding error:nil] : nil;
+    if (g_arch_bundle && pso_bundle_covers(pairs, want, zero, rest)) {   // the archive made offline holds them: only the pairs it left to the device (function constants) are built here
+        if (!rest.length) { g_pre_running = 0; return -1; }
+        txt = rest; want = pre_stamp(rest, zero); pairs = pre_parse(rest); pp = rp; txt2 = nil;
+    }
+    if (!g_ser4 || !g_arch_dir) { g_pre_running = 0; return -1; }
     NSString *stamp = [g_arch_dir stringByAppendingPathComponent:@"prebuilt.tsv"];
-    NSString *want = [NSString stringWithFormat:@"chain\t%s\ndepth\t%s\npairs\t%lu\t%lx\n", DMSH_CHAIN, zero ? "near=0" : "near=-w", (unsigned long)txt.length, (unsigned long)txt.hash];
     if ([[NSString stringWithContentsOfFile:stamp encoding:NSUTF8StringEncoding error:nil] isEqualToString:want]) { g_pre_running = 0; return -1; }
-    NSMutableArray<NSArray<NSString *> *> *pairs = [NSMutableArray array];
-    NSMutableSet<NSString *> *seen = [NSMutableSet set];
-    for (NSString *l in [txt componentsSeparatedByString:@"\n"]) { if (!l.length || [l hasPrefix:@"#"] || [seen containsObject:l]) continue; [seen addObject:l]; NSArray *c = [l componentsSeparatedByString:@"\t"]; if (c.count >= 2) [pairs addObject:c]; }
     int n = (int)pairs.count; uint64_t t0 = bp_now();
     MLOG("pipeline prebuild: %d shader pairs of %s%s%s, %d workers (%s)", n, pp.UTF8String, txt2 ? " and " : "", txt2 ? pp2.UTF8String : "", threads, wait ? "tool" : prepare_on() ? "prepare step, before the first frame" : "background");
     __block _Atomic int next = 0;
@@ -4954,7 +5041,7 @@ int mtl_pso_prebuild_tool(void) {
     mtl_init(); const char *z = getenv("DM_PSO_PREBUILD_DEPTH"); if (z && !strcmp(z, "zero")) atomic_store(&g_depth_zero, 1);
     int threads = getenv("DM_PSO_PREBUILD_THREADS") ? atoi(getenv("DM_PSO_PREBUILD_THREADS")) : 0;
     if (threads <= 0) { int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc <= 1) pc = 4; threads = pc - 1; }
-    if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: nothing to do (no archive, no shader_pairs.tsv, or prebuilt.tsv says it is done)");
+    if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: nothing to do (no archive, no shader_pairs.tsv, prebuilt.tsv says it is done, or the archive bundled with the app holds every base)");
     return 1;
 }
 static int prepare_on(void);

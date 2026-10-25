@@ -91,7 +91,9 @@ t_upgrade_alias.dSYM/
 t_stencil_view
 t_stencil_view.dSYM/
 t_pso_archive
+t_pso_bundle
 t_pso_archive.dSYM/
+t_pso_bundle.dSYM/
 t_pso_warm
 t_pso_warm.dSYM/
 t_depth16_clear

@@ -158,6 +158,7 @@ Resource locations:
 | `DM_PSO_HYBRID=0` | A draw whose pipeline is not built yet waits for it, instead of drawing with the pair's pulling pipeline meanwhile (docs/development.md, "Hybrid pipelines") |
 | `DM_PSO_PREBUILD=0` or `tool` | No prebuild of the pulling bases into the archive (in the prepare step, or in the background without one); `tool`: run the prebuild alone and exit (`DM_PSO_PREBUILD_DEPTH=zero`, `DM_PSO_PREBUILD_THREADS=<n>`) |
 | `DM_PSO_PAIRS=path` | The prebuild's second pair table (default: `pso_pairs.tsv` beside the shader map) |
+| `DM_PSO_BUNDLE=folder` or `off` | The pipeline archive made offline (`dm/gfx/tools/pso_offline.py`): `<GPU architecture>.mtl4a` and `prebuilt.tsv`, read only; when it covers the shader pairs the device builds no prebuild bases. The iOS app sets it to its `pso/` folder when it has one (docs/development.md, "The pipeline archive made offline") |
 | `DM_PSO_WAITLOG=1` | Log each draw that waited more than 20 ms for its pipeline, with why no stand-in served it |
 | `DM_PSO_PULL_ALL=1` | Diagnostic: every draw that has a pulling pipeline draws with it |
 
