@@ -185,9 +185,11 @@ The bundle holds what the IPA holds, with the Mac's shader libraries:
   Resources/romfs/           the packed version's RomFS
   Resources/msl/b-<chain>/   the Mac shader libraries (vk/ or gl/ for a Vulkan or GL game), without the compile cache cas/, which the host never reads
   Resources/aoc/<index>/     the DLC, when the folder has some
-  Resources/dm/              the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv, pso_manifest.tsv, c1_full.tsv and cb_extent.tsv, font/, env.txt (--env-file)
+  Resources/dm/              the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv, pso_manifest.tsv, c1_full.tsv, cb_extent.tsv, shader_pairs.tsv and pso_pairs.tsv, font/, env.txt (--env-file)
   Resources/AppIcon.icns
 ```
+
+The shader pairs are what the pipeline prebuild and the hybrid pipelines read ([Hybrid pipelines](#hybrid-pipelines)), as in the IPA: an app without them logged `pipeline prebuild: no …/Resources/dm/shader_pairs.tsv, nothing to build`, made no pulling bases, and so had no stand-in for a draw whose pipeline was not built yet; each new pipeline compiled on the submit thread (Breath of the Wild: frames of 100–546 ms).
 
 The RomFS, the shader libraries and the DLC are APFS clones (`cp -c`) of the build's files when the app is on the same APFS volume, so they take no space of their own; on another volume they are copied, after a check for free space. The app is written as `<app>.partial` and replaces the old one only when it is complete.
 
