@@ -4533,8 +4533,10 @@ static os_unfair_lock g_pbase_lock = OS_UNFAIR_LOCK_INIT;
 static NSString *pso_user_path(void);
 // The pipeline archive made offline (dm/gfx/tools/pso_offline.py, metal-tt) and bundled with the app: DM_PSO_BUNDLE=<folder> (the iOS app sets it to its pso/ folder when it has one;
 // off: not used) holds <GPU architecture>.mtl4a per architecture it was built for and prebuilt.tsv, what it covers (pso_prebuild). The file named after this device's architecture is
-// opened read only and looked up first among the files of bases without a vertex layout; it is never written or compacted. A system that cannot open it (one older than the archive's
-// minimum, or an OS update that changed the GPU compiler) or a GPU it was not built for gets an info line, and the device builds the bases itself as before
+// opened read only and looked up first among the files of bases without a vertex layout; it is never written or compacted. The device's own archive (pso_archive/) so takes only
+// what it lacks: a draw, the prewarm and the prebuild compile a base, and the serializer captures it, only after the bundle missed (it holds no base with a vertex layout). A system
+// that cannot open it (one older than the archive's minimum, or an OS update that changed the GPU compiler) or a GPU it was not built for gets an info line, and the device builds
+// the bases itself as before (the on-device prebuild is the fallback)
 static id<MTL4Archive> g_arch_bundle; static NSString *g_bundle_dir;
 // A file newArchiveWithURL may be given: it starts as a pipeline archive does, a Mach-O image (the Metal 4 serializer's, metal-tt's for one GPU) or a universal one (metal-tt's for
 // several, or a serializer's on some systems). Metal itself crashed (MTL4ArchiveImpl::loadFromURL) on a text file, and on a bare Mach-O header: only the start can be checked
