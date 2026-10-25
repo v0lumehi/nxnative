@@ -208,6 +208,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 ## Frame rate
 
 - a 30 fps game to run at 60; after the floor was lowered, slow motion on a GPU-bound device (GitHub issue #9). → [sead's dynamic present interval, `ksys::VFR` and the host's frame step](../reference/frame-rate.md#seads-dynamic-present-interval-ksysvfr-and-the-hosts-frame-step)
+- on an iPhone, a game with the frame step at 60 fps drops a frame in most windows after a few minutes, and its GPU time per frame roughly doubles to triples (17-26 ms for the same scenes). → [A thermally serious iPhone holds 30 fps](../reference/frame-rate.md#a-thermally-serious-iphone-holds-30-fps)
 - slow motion when the GPU is the bottleneck: a game's interval controller that times the GPU never steps up (GitHub issue #9). → [GPU timestamps per submission segment](../reference/frame-rate.md#gpu-timestamps-per-submission-segment)
 - GPU time reads 32 times too small when a game converts raw NVN counter timestamps itself. → [Raw NVN timestamp units](../reference/frame-rate.md#raw-nvn-timestamp-units)
 - the game presents at interval 1, yet every frame takes exactly 33.3 ms of "frame work"; after only the limiter was raised, everything ran twice as fast on the iPhone. → [A render-thread limiter with a constant and a fixed time step](../reference/frame-rate.md#a-render-thread-limiter-with-a-constant-and-a-fixed-time-step)
