@@ -13,6 +13,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** probes confirmed the legacy result: the framework presents at interval 1, VFR reports interval 1 with ratio 0.5, and when a frame runs long the game steps back to 2 with ratio 1, so the game speed does not change.
 - **Note:** the zeldaret/botw decompilation (`VFR.cpp`) gave the semantics; 1.9.0's addresses were found by the constants (`60 / interval`, the `fmov s11, #2.0` floor).
 
+### Variable frame step above 60 fps
+
+- **Symptom:** a game whose own logic steps in whole 30 or 60 fps frames runs too fast or uneven above 60 fps; with a cap that does not divide the screen's rate (120 on 144 Hz, 240 on 360 Hz) it runs faster than real time.
+- **Cause:** the whole-vsync frame step hands the game steps of 1 to 3 vsyncs, which cannot express 120 fps. Frames whose starts follow display-link ticks on a screen whose rate is not a multiple of the cap lie on the nearest refreshes (6.9 and 13.9 ms apart in turn at 120 on 144 Hz, 2.8 and 5.6 ms at 240 on 360 Hz), so a floor on the step that raises the short ones runs the game ahead (1.12 and 1.17 of real time).
+- **Fix:** a build whose rewriter table names `VAR_STEP` takes `fps_target` / `DM_FPS_TARGET` 61 to 240 (`loader.c` refuses it on other builds). Each frame steps the game by the time the previous one took, in 1/30 s units (`nvn_fstep.h` `nvn_vstep_next`, `hle_nvn.c` `vstep_tick`, state page +0x50): at least 1/240 s, with the time that floor adds carried into the next steps so game time keeps real time, at most the game's own longest step (1.5; longer frames slow the game down, as on the Switch). The build's stubs latch the step once a game frame (+0x54) so every reader in a frame uses one value, as the whole-vsync step is latched through the framework setter. While the game fixes its own step or a prerendered movie halves the cap the whole-vsync step holds, and the variable step starts again from the next frame afterwards (`vstep_off` resets it: the frames between were stepped already). The display link runs at the cap (`nvn_mtl.m` `link_range` mode 4) and each frame is shown on its next tick.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0; its note has the stubs, the interval readers that had to take the frame ratio and the measurements).
+- **Check:** `t_fstep` (steady 120, 120 on 144 Hz, 240 on 360 Hz, the reset after whole-vsync frames, the longest step); the log line `variable frame step: … fps, game time … (… of real time)` every 1,800 presents.
+
 ### GPU timestamps per submission segment
 
 - **Symptom:** slow motion when the GPU is the bottleneck: a game's interval controller that times the GPU never steps up (GitHub issue #9).
