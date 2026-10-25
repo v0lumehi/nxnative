@@ -82,9 +82,14 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
+// DM_NVN_WPROBE: the pages of the game's write faults, for the read-set intersection (hle_nvn.c)
+enum { FLOG_N = 65536 }; static uintptr_t g_flog[FLOG_N]; static _Atomic uint64_t g_flog_n; static int g_flog_on;
+void nvn_dirty_fault_log(int on) { g_flog_on = on; }
+uint64_t nvn_dirty_fault_take(uintptr_t *out, uint64_t from, uint64_t max) { uint64_t n = atomic_load(&g_flog_n), k = 0; if (n - from > FLOG_N) from = n - FLOG_N; for (uint64_t i = from; i < n && k < max; i++) out[k++] = g_flog[i % FLOG_N]; return n; }
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
+    if (g_flog_on) { uint64_t i = atomic_fetch_add(&g_flog_n, 1); g_flog[i % FLOG_N] = (uintptr_t)addr; }
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
