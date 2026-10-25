@@ -85,7 +85,8 @@ def run_one(a, gid, build, var, route, out, lock):
                DM_NVN_TSV=str(out / 'frames.tsv'), DM_NVN_TSV_CALLS='0', DM_CTL=str(out / 'ctl'), DM_METAL_HUD='0' if a.no_hud else '1')
     if (build / 'aoc').is_dir(): env['DM_AOC_DIR'] = str(build / 'aoc')
     if var.get('pso') or a.pso_archive: env['DM_PSO_ARCHIVE'] = var.get('pso') or a.pso_archive
-    if a.fps: env.update(DM_FPS_TARGET=str(a.fps), DM_PRESENT_HZ=str(a.fps), DM_PRESENT_LINK='2')
+    if a.fps: env['DM_FPS_TARGET'] = str(a.fps)
+    if a.fps and a.fps > 60: env.update(DM_PRESENT_HZ=str(a.fps), DM_PRESENT_LINK='2')   # the display link at the screen's rate for the variable frame step; at 60 or 30 the host matches the screen to the cap itself
     if a.scale: env['DM_RENDER_SCALE'] = str(a.scale)
     for kv in a.env: k, _, v = kv.partition('='); env[k] = v
     for k, v in var.items():
@@ -141,7 +142,7 @@ def main():
     ap.add_argument('--save', help='the save folder the route starts from (default <id>_build/run/save)')
     ap.add_argument('--variant', action='append', default=[], help="'label:KEY=VALUE,…' (repeatable); keys host, msl, shmap, patched, pso take paths")
     ap.add_argument('--runs', type=int, default=2)
-    ap.add_argument('--fps', type=int, help='DM_FPS_TARGET for every variant, with the display link at that rate')
+    ap.add_argument('--fps', type=int, help='DM_FPS_TARGET for every variant (above 60 with the display link at that rate)')
     ap.add_argument('--scale', type=float, help='DM_RENDER_SCALE for every variant')
     ap.add_argument('--env', action='append', default=[], help='KEY=VALUE for every variant (repeatable)')
     ap.add_argument('--pso-archive', help='DM_PSO_ARCHIVE for every variant (the pipeline archive; default the host\'s own)')
