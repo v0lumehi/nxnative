@@ -1292,7 +1292,12 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    // The sync (fenced 2: an acquire sync). The texture is free for rendering at once in the queue's order (its last present's blit, or its snapshot copy, is committed before
+    // anything the game submits next), so the fence only bounds how far the game's CPU runs ahead of the GPU: the queue's last fence at the present acq_depth - 1 presents ago
+    // (frames in flight, DM_NVN_ACQ_DEPTH). Depth 1 is the newest fence: a game that waits for it drains the GPU every frame
+    if (s) { static int depth = -1; if (depth < 0) { const char *e = getenv("DM_NVN_ACQ_DEPTH"); depth = e ? atoi(e) : 1; if (depth < 1) depth = 1; if (depth > 4) depth = 4; LOG("[nvn] acquire syncs: %d frame%s in flight (DM_NVN_ACQ_DEPTH)", depth, depth > 1 ? "s" : ""); }
+        uint64_t k = o->presents >= (uint64_t)(depth - 1) ? o->presents - (uint64_t)(depth - 1) : 0;
+        ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = depth == 1 ? mtl_last_fence() : k ? o->pfence[k % 4] : 0; }
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1700,7 +1705,7 @@ static void vstep_tick(const win_t *o) {
 static void vstep_off(void) { if (dm_fps_var_cap) memset(dm_fps_state + 0x50, 0, 4); }   // the whole-vsync step holds (the game's own step, a prerendered movie)
 __attribute__((weak)) _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP): when the last present was made; graphics unit tests have no hle_thread.c
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
-    (void)q; win_t *o = (win_t *)w; o->presents++;
+    (void)q; win_t *o = (win_t *)w; o->presents++; o->pfence[o->presents % 4] = mtl_last_fence();
     dm_fps_lock_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
     if (fstep_on()) { if (vstep_on()) vstep_tick(o); else { vstep_off(); fstep_tick(o); } }
