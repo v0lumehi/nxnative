@@ -1045,10 +1045,61 @@ static int gw_live(uint64_t lo, uint64_t hi) {
     return 0;
 }
 // The submission's GPU writes go into the page table with its fence (mtl_sub_commit)
+// Inline uniform updates of submissions still running (DM_NVN_OVERLAY, on by default). Their bytes are known on the CPU (the update ring), so a shadow made while they run lays them
+// over memory, oldest submission first and in queue order, before this submission's own writes, instead of refusing the range until they complete: a game whose CPU runs ahead of
+// the GPU (no wait at the frame's end) rewrites the same uniform pages every frame, and each refusal ended a pass (Breath of the Wild with its frame-end waits one frame back:
+// about 270 refusals and 2.5 times the passes a frame). Copies, fills and the GPU's own writes still go to the page table and are refused. A submission's list (the newest update
+// of each range only, the ring blocks retained) is let go once its fence has completed
+enum { OVL_SUBS = 8, OVL_MAX = 4096 };
+typedef struct { uint64_t lo, hi; size_t off; CFTypeRef buf; } ovl_ent;   // buf: the update ring block (retained), the bytes for lo at off
+static struct { uint64_t fence, lo, hi; int n; ovl_ent *e; } g_ovl[OVL_SUBS];   // per running submission; lo / hi: the span of its entries
+static int ovl_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_OVERLAY"); v = !(e && !strcmp(e, "0")); } return v; }
+static void ovl_free(int i) { for (int k = 0; k < g_ovl[i].n; k++) CFRelease(g_ovl[i].e[k].buf); free(g_ovl[i].e); g_ovl[i].e = NULL; g_ovl[i].n = 0; g_ovl[i].fence = 0; }
+static void ovl_reap(uint64_t done) { for (int i = 0; i < OVL_SUBS; i++) if (g_ovl[i].fence && g_ovl[i].fence <= done) ovl_free(i); }
+// The submission's inline updates (pend kind 1 with ring bytes) → a new list; 0 when it cannot hold them (they go to the page table then)
+static int ovl_add(uint64_t fence) {
+    ovl_reap(g_done);
+    int slot = -1; for (int i = 0; i < OVL_SUBS; i++) if (!g_ovl[i].fence) { slot = i; break; }
+    if (slot < 0) return 0;
+    int n = 0; for (int e = 0; e < g_npend; e++) if (g_pend_kind[e] == 1 && g_pend_upd[e]) n++;
+    if (!n) return 1;
+    ovl_ent *v = malloc(sizeof *v * (size_t)(n < OVL_MAX ? n : OVL_MAX)); if (!v) return 0;
+    // Newest first, keeping one entry per exact range (a block rewritten before every draw group keeps its last bytes); an older entry another range overlaps stays, in order
+    enum { HN = 8192 }; static uint64_t hk[HN]; static uint32_t hg[HN], gen; gen++;
+    int k = 0, lo_set = 0; uint64_t lo = 0, hi = 0;
+    for (int e = g_npend - 1; e >= 0; e--) { if (g_pend_kind[e] != 1 || !g_pend_upd[e]) continue;
+        uint64_t key = g_pend_lo[e] * 0x9E3779B97F4A7C15ull ^ g_pend_hi[e]; unsigned h = (unsigned)(key >> 51) & (HN - 1), probe = 0; int dup = 0;
+        while (hg[h] == gen && probe < 16) { if (hk[h] == key) { dup = 1; break; } h = (h + 1) & (HN - 1); probe++; }
+        if (dup) continue; if (probe < 16) { hk[h] = key; hg[h] = gen; }
+        if (k == OVL_MAX) { for (int i = 0; i < k; i++) CFRelease(v[i].buf); free(v); return 0; }
+        const upd_ent *u = &g_upd[g_pend_upd[e] - 1];
+        v[k++] = (ovl_ent){g_pend_lo[e], g_pend_hi[e], u->off + (g_pend_lo[e] - u->lo), CFBridgingRetain(u->buf)};
+        if (!lo_set || g_pend_lo[e] < lo) lo = g_pend_lo[e]; if (g_pend_hi[e] > hi) hi = g_pend_hi[e]; lo_set = 1; }
+    for (int i = 0; i < k / 2; i++) { ovl_ent t = v[i]; v[i] = v[k - 1 - i]; v[k - 1 - i] = t; }   // back to queue order
+    g_ovl[slot].e = v; g_ovl[slot].n = k; g_ovl[slot].lo = lo; g_ovl[slot].hi = hi; g_ovl[slot].fence = fence;
+    return 1;
+}
+// Lay the running submissions' updates over a shadow d of [lo, hi): oldest submission first (with the copy worker when defer, behind the copy from memory)
+static uint64_t ovl_apply(uint8_t *d, uint64_t lo, uint64_t hi, int defer, uint64_t ready) {
+    uint64_t done = g_done; int ord[OVL_SUBS], no = 0;
+    for (int i = 0; i < OVL_SUBS; i++) if (g_ovl[i].fence > done && g_ovl[i].lo < hi && g_ovl[i].hi > lo) { int j = no++; while (j > 0 && g_ovl[ord[j - 1]].fence > g_ovl[i].fence) { ord[j] = ord[j - 1]; j--; } ord[j] = i; }
+    for (int q = 0; q < no; q++) { int i = ord[q];
+        for (int k = 0; k < g_ovl[i].n; k++) { const ovl_ent *x = &g_ovl[i].e[k]; if (x->lo >= hi || x->hi <= lo) continue;
+            uint64_t a = x->lo > lo ? x->lo : lo, b = x->hi < hi ? x->hi : hi;
+            const uint8_t *src = (const uint8_t *)((__bridge id<MTLBuffer>)x->buf).contents + x->off + (a - x->lo);
+            if (defer) ready = ubc_push(d + (a - lo), src, (size_t)(b - a)); else memcpy(d + (a - lo), src, (size_t)(b - a)); } }
+    return ready;
+}
+static int ovl_hits(uint64_t lo, uint64_t hi) {   // a running submission's inline update overlaps [lo, hi)
+    uint64_t done = g_done;
+    for (int i = 0; i < OVL_SUBS; i++) if (g_ovl[i].fence > done && g_ovl[i].lo < hi && g_ovl[i].hi > lo) for (int k = 0; k < g_ovl[i].n; k++) if (g_ovl[i].e[k].lo < hi && g_ovl[i].e[k].hi > lo) return 1;
+    return 0;
+}
 static void gw_commit(uint64_t fence) {
     uint64_t done = g_done;
     if ((g_pend_over || g_sbw_over) && fence > g_gw_all) g_gw_all = fence;
-    for (int e = 0; e < g_npend; e++) gw_put(g_pend_lo[e], g_pend_hi[e], fence, done);
+    int ovl = ovl_on() && !g_pend_over && ovl_add(fence);
+    for (int e = 0; e < g_npend; e++) if (!ovl || g_pend_kind[e] != 1 || !g_pend_upd[e]) gw_put(g_pend_lo[e], g_pend_hi[e], fence, done);
     if (g_nsbw) for (int i = 0; i < SBW_N; i++) if (g_sbwp[i].gen == g_pend_gen) gw_put(g_sbwp[i].page << 12, (g_sbwp[i].page + 1) << 12, fence, done);
 }
 // The writes queued in this submission from index since on that overlap [a, b), newest first, into out (room for every entry a lookup can meet); -1 when they cannot all be told
@@ -1103,6 +1154,7 @@ static int ubp_get(uint64_t lo, uint64_t hi, uint64_t *gpu, const uint8_t **cpu)
     int defer = len >= 512 && ubc_on(); uint64_t ready = 0;   // small ones (bindless handles read on the CPU) are copied here
     if (defer) ready = ubc_push(d, c ? c->cpu : (const uint8_t *)(uintptr_t)lo, (size_t)len);   // the previous shadow's own copies are queued before these
     else { if (c) ubc_wait(c->ready); memcpy(d, c ? c->cpu : (const uint8_t *)(uintptr_t)lo, (size_t)len); }
+    if (!c && ovl_on()) ready = ovl_apply(d, lo, hi, defer, ready);   // updates of running submissions, before this submission's own
     for (int i = nk - 1; i >= 0; i--) { int e = g_ubp_idx[i]; const upd_ent *u = &g_upd[g_pend_upd[e] - 1];   // oldest first: each byte ends with the newest write
         uint64_t x = g_pend_lo[e] > lo ? g_pend_lo[e] : lo, y = g_pend_hi[e] < hi ? g_pend_hi[e] : hi;
         const uint8_t *src = (const uint8_t *)u->buf.contents + u->off + (x - u->lo);
@@ -5726,7 +5778,7 @@ static void ubo_read(int stage, int reg, int off, size_t n, void *out) {
     const p_bind_buf *u = &S.ubo[stage][reg];
     if (!u->addr || (uint64_t)off + n > u->size) return;
     if (g_nubd && ubd_hits(u->addr + off, u->addr + off + n) && ubd_covers(u->addr + off, u->addr + off + n)) { ubd_read(u->addr + off, n, out); return; }   // written by an inline update deferred in this pass
-    { uint64_t g; const uint8_t *c; if (pend_hits(u->addr + off, n) && ubp_get(u->addr + off, u->addr + off + n, &g, &c)) { ubc_wait(g_ubp_ready); memcpy(out, c, n); return; } }   // memory and the inline updates queued over it
+    { uint64_t g; const uint8_t *c; if ((pend_hits(u->addr + off, n) || (ovl_on() && ovl_hits(u->addr + off, u->addr + off + n))) && ubp_get(u->addr + off, u->addr + off + n, &g, &c)) { ubc_wait(g_ubp_ready); memcpy(out, c, n); return; } }   // memory and the inline updates queued over it
     if (pend_hits(u->addr + off, n)) { int kind; if (pend_read(u->addr + off, n, out, &kind)) return;   // written by an inline update queued in this submission: its data
         RED_ONCE(47, "the uniform buffer holding bindless handles (stage %d slot %d +%#x) has GPU-side writes in this submission (%s): the current value is read", stage, reg, off,
                  kind == 2 ? "a buffer copy" : kind == 3 ? "a fill" : kind == 1 ? "an inline update covering part of it" : "more writes than the host tracks"); }
