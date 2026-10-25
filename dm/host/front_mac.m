@@ -26,6 +26,13 @@ static int g_input_on = 1;   // main thread: the game window is key, so its keyb
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
 int front_screen_max_fps(void) { return g_screen_fps; }
+static int g_scr_px[2];   // the pixel size of the screen the window opens on
+static void scr_px_read(void) { NSScreen *sc = NSScreen.mainScreen; if (!sc) return; NSSize px = [sc convertRectToBacking:sc.frame].size; g_scr_px[0] = (int)px.width; g_scr_px[1] = (int)px.height; }
+// Asked before front_run (main.c dm_fps_state_apply, on the main thread): the main screen, where the window opens; 0 without a window (DM_WINDOW)
+int front_screen_px(int *w, int *h) {
+    if (!g_scr_px[0] && getenv("DM_WINDOW")) { if (NSThread.isMainThread) { [NSApplication sharedApplication]; scr_px_read(); } else dispatch_sync(dispatch_get_main_queue(), ^{ scr_px_read(); }); }
+    *w = g_scr_px[0]; *h = g_scr_px[1]; return g_scr_px[0] > 0;
+}
 // The screen's refresh rate matched to the game's frame rate in fullscreen (front_screen_match, from PR #79; DM_SCREEN_MATCH=0 turns it off). 60 fps on a 144 Hz screen cannot be paced
 // evenly: the display link counts a tick on the refresh nearest each 1/60 s slot (nvn_mtl.m link_range), so frames stay up 2 and 3 refreshes in turn (13.9 / 20.8 ms) and Apple's HUD shows
 // the frame interval jumping between them. In fullscreen, a screen whose rate is not a multiple of the game's switches to the mode of the same size with the highest rate that is (144 → 120 Hz

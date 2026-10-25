@@ -21,6 +21,13 @@ static void front_ios_power_watch(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
 
+// The screen's native pixel size (portrait; loader.c scene_output turns it to landscape), read on the main thread
+int front_screen_px(int *w, int *h) {
+    static int px[2];
+    if (!px[0]) { void (^rd)(void) = ^{ CGRect b = UIScreen.mainScreen.nativeBounds; px[0] = (int)b.size.width; px[1] = (int)b.size.height; };
+        if (NSThread.isMainThread) rd(); else dispatch_sync(dispatch_get_main_queue(), rd); }
+    *w = px[0]; *h = px[1]; return px[0] > 0;
+}
 @interface DmGameView : UIView
 @end
 @implementation DmGameView
