@@ -1,17 +1,34 @@
 // Launcher: the settings screen shown before the game starts (front_ios.m dm_show_launcher). Its settings come from the app's dm/launcher.json, which build_ipa.sh writes for this game
 // from dm/games/settings.tsv (dm/games/settings.py): each sets an environment variable the host reads when the game starts. A variable an env file set (Documents/env.txt, the bundle's
-// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. The choices are kept in UserDefaults. DM_LAUNCHER=0 in Documents/env.txt starts the game at once, as an app
-// without launcher.json does
+// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. Choices that differ from the game's default are kept in UserDefaults. Settings whose page is advanced are on the Advanced page, whose
+// Reset to tested defaults forgets the choices there, so the game profile's defaults (the settings it was tested with) apply again. DM_LAUNCHER=0 in Documents/env.txt starts the
+// game at once, as an app without launcher.json does
 import SwiftUI
 import UIKit
 import os
 
 private struct Setting: Decodable, Identifiable {
     let env, kind, label, note, def: String
+    let page: String?   // main or advanced
     let options: [[String]]?   // choice: [value, label]
     let min, max, step: Double?   // range
+    let on, off: String?   // toggle: the values the variable takes (1 / 0 when not given)
     var id: String { env }
-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", options, min, max, step }
+    var advanced: Bool { page == "advanced" }
+    var onValue: String { on ?? "1" }
+    var offValue: String { off ?? "0" }
+    func isDefault(_ v: String) -> Bool {   // a range compares as numbers (a slider writes 1.00 for 1.0)
+        kind == "range" ? abs((Double(v) ?? .nan) - (Double(def) ?? .nan)) < 1e-6 : v == def
+    }
+    func accepts(_ v: String) -> Bool {   // a saved choice the game still offers
+        switch kind {
+        case "choice": return options?.contains { $0[0] == v } ?? false
+        case "range": return Double(v) != nil
+        case "toggle": return v == onValue || v == offValue
+        default: return true
+        }
+    }
+    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", page, options, min, max, step, on, off }
 }
 private struct SettingsFile: Decodable { let settings: [Setting] }
 
@@ -29,19 +46,33 @@ private final class LauncherModel: ObservableObject {
         for s in settings {
             if fromFile.contains(s.env), let v = ProcessInfo.processInfo.environment[s.env] { values[s.env] = v; continue }
             let saved = defaults.string(forKey: "launcher." + s.env)
-            values[s.env] = saved.flatMap { v in s.options == nil || s.options!.contains { $0[0] == v } ? v : nil } ?? s.def   // a saved choice the game no longer offers: its default
+            values[s.env] = saved.flatMap { s.accepts($0) ? $0 : nil } ?? s.def   // a saved choice the game no longer offers: its default
         }
+    }
+
+    var main: [Setting] { settings.filter { !$0.advanced } }
+    var advanced: [Setting] { settings.filter { $0.advanced } }
+    var advancedChanged: Bool { advanced.contains { !fromFile.contains($0.env) && !$0.isDefault(values[$0.env] ?? $0.def) } }
+
+    // Reset to tested defaults: the Advanced page's choices are forgotten and its rows show the game's defaults again (an env file's values stay)
+    func resetAdvanced() {
+        for s in advanced where !fromFile.contains(s.env) {
+            defaults.removeObject(forKey: "launcher." + s.env)
+            values[s.env] = s.def
+        }
+        fputs("launcher: advanced settings reset to the game's defaults\n", stderr)
     }
 
     func binding(_ s: Setting) -> Binding<String> { Binding(get: { self.values[s.env] ?? s.def }, set: { self.values[s.env] = $0 }) }
 
-    // Before the game starts: every setting not set by an env file goes into the environment (DM_LANG replaces the packed language main.m set as a default)
+    // Before the game starts: every setting not set by an env file goes into the environment (DM_LANG replaces the packed language main.m set as a default). Only a choice that
+    // differs from the game's default is stored: a setting the player left at its default follows the defaults of a later build (the settings it was tested with)
     func apply() {
         for s in settings {
             let v = values[s.env] ?? s.def
             if fromFile.contains(s.env) { fputs("launcher: \(s.env) kept at \(v) (env file)\n", stderr); continue }
-            defaults.set(v, forKey: "launcher." + s.env)
-            setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\n", stderr)
+            if s.isDefault(v) { defaults.removeObject(forKey: "launcher." + s.env) } else { defaults.set(v, forKey: "launcher." + s.env) }
+            setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\(s.isDefault(v) ? "" : " (changed)")\n", stderr)
         }
     }
 }
@@ -106,7 +137,7 @@ private struct SettingRow: View {
                     }
                 }
             default:
-                Toggle(isOn: Binding(get: { (m.values[s.env] ?? s.def) == "1" }, set: { m.values[s.env] = $0 ? "1" : "0" })) {
+                Toggle(isOn: Binding(get: { (m.values[s.env] ?? s.def) == s.onValue }, set: { m.values[s.env] = $0 ? s.onValue : s.offValue })) {
                     settingLabel
                 }
             }
@@ -140,7 +171,10 @@ private struct LauncherView: View {
                 NavigationStack {
                     List {
                         Section {
-                            ForEach(m.settings) { SettingRow(s: $0, m: m) }
+                            ForEach(m.main) { SettingRow(s: $0, m: m) }
+                            if !m.advanced.isEmpty {
+                                NavigationLink("Advanced") { AdvancedView(m: m) }
+                            }
                         }
                         Section {
                             HStack {
@@ -177,6 +211,30 @@ private struct LauncherView: View {
         guard let icons = info("CFBundleIcons") as? [String: Any], let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
               let files = primary["CFBundleIconFiles"] as? [String], let last = files.last else { return nil }
         return UIImage(named: last)
+    }
+}
+
+// The Advanced page: settings that trade latency, memory or heat for smoothness, and the action that brings back the ones the game was tested with
+private struct AdvancedView: View {
+    @ObservedObject var m: LauncherModel
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(m.advanced) { SettingRow(s: $0, m: m) }
+            }
+            Section {
+                Button("Reset to tested defaults") { m.resetAdvanced() }
+                    .disabled(!m.advancedChanged)
+            } footer: {
+                Text("Brings back the settings this game was tested with.")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .contentMargins(.horizontal, 12, for: .scrollContent)
+        .navigationTitle("Advanced")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
     }
 }
 
