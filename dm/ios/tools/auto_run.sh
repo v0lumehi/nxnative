@@ -85,6 +85,6 @@ say "pulled: $(cd "$R" && ls | tr '\n' ' ')"
 [ -n "$LOCK" ] && rm -f "$LOCK"
 # --- summaries (Mac only from here)
 TA=(); [ -d "$R/trace.trace" ] && TA=(--trace "$R/trace.trace")
-python3 "$TOOLS/frame_timeline.py" "$R" --from-mark steady --to-mark end "${TA[@]}" --json "$R/summary.json" > "$R/summary.txt" 2>&1 || say "[RED] frame_timeline.py failed (see summary.txt)"
+python3 "$TOOLS/frame_timeline.py" "$R" --from-mark steady --to-mark end ${TA[@]+"${TA[@]}"} --json "$R/summary.json" > "$R/summary.txt" 2>&1 || say "[RED] frame_timeline.py failed (see summary.txt)"
 [ -n "${DM_GPUPROF_PY:-}" ] && LC_ALL=C grep -aq "\[gpuprof\]" "$R/log.txt" && python3 "$DM_GPUPROF_PY" "$R/log.txt" > "$R/gpuprof.txt" 2>&1
 cat "$R/summary.txt"
