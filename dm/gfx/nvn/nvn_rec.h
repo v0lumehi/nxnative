@@ -69,6 +69,7 @@ enum {
     RO_T_ADDR, RO_T_TEX, RO_T_SAMP,
     RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
     RO_NOTE,   // a[0] an _Atomic uint64_t, a[1] a value: the encode thread has made every call before this one (rec_note_wait)
+    RO_FX,     // a MetalFX spatial scaler encoded into the main command buffer: a[0] the scaler, a[1] its input, a[2] its output, a[3] / a[4] the input's content size (rec_fx)
 };
 typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj slots hold retained objects (0 for nil), released once the call is made
 enum { REC_BLK = 256 };
@@ -168,6 +169,8 @@ static void rec_exec(const rec_t *r) {
     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
     case RO_NOTE: { _Atomic uint64_t *p = (_Atomic uint64_t *)(uintptr_t)a[0]; pthread_mutex_lock(&g_note_mu); if (a[1] > atomic_load(p)) atomic_store(p, a[1]); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); break; }
+    case RO_FX: { id<MTL4FXSpatialScaler> sc = rec_id(a[0]); sc.colorTexture = rec_id(a[1]); sc.outputTexture = rec_id(a[2]); sc.inputContentWidth = a[3]; sc.inputContentHeight = a[4];
+        [sc encodeToCommandBuffer:(id<MTL4CommandBuffer>)g_rx_cb]; break; }
     default: MDIE("deferred encoding: unknown record %u", r->op);
     }
     for (uint32_t i = 0; i < r->nobj; i++) if (a[i]) CFRelease((CFTypeRef)(uintptr_t)a[i]);
@@ -329,5 +332,11 @@ static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
     if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb); return; }
     id<MTL4CommandBuffer> buffers[] = {cb};
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+}
+// A MetalFX spatial scaler into the replay's main command buffer, between its encoders (no encoder may be open): its input's content of w x h (from the origin) into its output
+static void rec_fx(id cb, id<MTL4FXSpatialScaler> sc, id<MTLTexture> in, id<MTLTexture> out, NSUInteger w, NSUInteger h) {
+    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_FX, 3); r->a[0] = rec_obj(sc); r->a[1] = rec_obj(in); r->a[2] = rec_obj(out); r->a[3] = w; r->a[4] = h; return; }
+    sc.colorTexture = in; sc.outputTexture = out; sc.inputContentWidth = w; sc.inputContentHeight = h;
+    [sc encodeToCommandBuffer:(id<MTL4CommandBuffer>)cb];
 }
 static void rec_signal(id ev, uint64_t v) { if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_SIGNAL, 1); r->a[0] = rec_obj(ev); r->a[1] = v; } else [g_q4 signalEvent:ev value:v]; }
