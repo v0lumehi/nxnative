@@ -53,7 +53,7 @@ typedef struct { uint32_t magic; samp_par p; } samp_t;                          
 // The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see prog_keys in hle_nvn.c
 typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
 
-typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;                            FITS(sync_t, NVNsync);
+typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;   /* fenced 2: by WindowAcquireTexture */                           FITS(sync_t, NVNsync);
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
 typedef struct { uint32_t magic; volatile uint32_t *val; } ev_t;                              FITS(ev_t, NVNevent);
 
