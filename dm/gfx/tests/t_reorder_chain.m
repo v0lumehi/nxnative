@@ -129,6 +129,23 @@ static uint64_t query_case(int reordered, int mode) {
     const char *names[]={"query","same_range_query","later_reset_overrides_query"};
     save_raw(names[mode],reordered,q,sizeof q); mtl_pool_del(c.p); free(c.p); return q[0];
 }
+// Samples passed over many submissions without a reset (Breath of the Wild resets once): each submission's slots are folded into a base sum when its visibility buffer
+// is reused, so the slot list stays short and the report still counts every submission since the reset (the first 8x8 draw's 64 samples were read from a reused buffer before)
+static uint64_t query_multi_case(int subs, int *max_slots) {
+    tex_t a=texture(8,1,0),b=texture(4,1,0); uint64_t q[2]={UINT64_MAX,0}, type=NVN_COUNTER_TYPE_SAMPLES_PASSED; *max_slots=0;
+    state_reset(); memset(&R,0,sizeof R); vis_clear(); g_vis_on=g_vis_counting=0;
+    for(int i=0;i<=subs;i++) {
+        chain c=make_chain();
+        if(!i) { emit(&c,OP_RESET_COUNTER,&type,8); stencil(&c,0,8,1,255,255,0); blending(&c,0); clear(&c,&a,0,NULL,0,0,0); draw_prog(&c,0,0); }
+        else { clear(&c,&b,0,NULL,0,0,0); draw_prog(&c,1,0); }
+        if(i==subs) { uint64_t report[2]={type,(uint64_t)q}; emit(&c,OP_REPORT_COUNTER,report,sizeof report); }
+        emit(&c,OP_END,NULL,0);
+        mtl_sub_begin(); mtl_exec(c.p); if(g_nvs>*max_slots) *max_slots=g_nvs;
+        if(!mtl_wait(mtl_sub_commit(),5000000000ull)) { printf("multi-submission query: submission %d did not complete\n",i); fail++; }
+        mtl_pool_del(c.p); free(c.p);
+    }
+    return q[0];
+}
 static void uniform_case(int reordered,uint8_t pixels[256]) {
     void *mem=NULL; if(posix_memalign(&mem,getpagesize(),getpagesize())) abort(); memset(mem,0,getpagesize());
     float red[4]={1,0,0,1},green[4]={0,1,0,1}; memcpy(mem,red,16); mtl_pool_add(mem,getpagesize());
@@ -271,6 +288,8 @@ int main(int argc,char **argv) { @autoreleasepool {
     EXPECT("same epoch, two fixed draws swapped: report stays 80",1,q0==q1);
     q0=query_case(0,2); q1=query_case(1,2); EXPECT("later reset overrides the unreported count (original)",16,q0); EXPECT("later reset overrides the unreported count (candidate)",16,q1);
     EXPECT("this fixed later reset dominates the report: 16 reported before and after the swap",1,q0==q1);
+    { int ms=0; uint64_t qm=query_multi_case(3*VIS_RING,&ms); EXPECT("samples passed over 25 submissions with one reset: 64 + 24 x 16",64+16*3*VIS_RING,qm);
+      EXPECT("slots of completed submissions folded: at most 2 in the list",1,ms<=2); }
     printf("CASE stencil_implicit_carry_read\n"); result co=stencil_carry_case(0),cr=stencil_carry_case(1);
     uniform_pixels("low bit cleared first gives bit1 = 0",co.c,0,0,0,255); uniform_pixels("increment carry first gives bit1 = 1",cr.c,0,255,0,255); compare_pair("stencil_implicit_carry_read",&co,&cr,64);
     printf("== %d checks, %d failed ==\n",count,fail); return fail!=0;
