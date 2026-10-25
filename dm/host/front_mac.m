@@ -221,7 +221,9 @@ static void *guest_tramp(void *p) {
 }
 
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
-__attribute__((constructor)) static void hud_env(void) { if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) setenv("MTL_HUD_ENABLED", "1", 0); }
+// MTL_HUD_HIDE_METALFX_METRICS: the HUD's MetalFX rows (a temporal scaler's exposure among them, which the present's spatial scaler has none of) jumped every frame with
+// DM_PRESENT_UPSCALE=metalfx; libMTLHud reads the variable as MTL_HUD_ENABLED, and one set before (the environment) is kept
+__attribute__((constructor)) static void hud_env(void) { if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { setenv("MTL_HUD_ENABLED", "1", 0); setenv("MTL_HUD_HIDE_METALFX_METRICS", "1", 0); } }
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
