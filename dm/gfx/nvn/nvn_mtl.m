@@ -577,7 +577,7 @@ static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time
 // and a report hands the slot table together with its buffer (retained) to the completion callback to sum and write back; after a report a new slot is used, so later draws are not counted into the reported value.
 // (Previously always wrote 0: occlusion query = 'fully occluded', campfires / light sources got culled - the character select screen calls ResetCounter 21 times per frame)
 typedef struct { void *buf; uint32_t slot; } vis_slot;
-typedef struct { int n; vis_slot s[]; } vis_list;
+typedef struct { int n; uint64_t base; vis_slot s[]; } vis_list;   // base: the samples of slots folded before the snapshot (vis_fold)
 #define VIS_SLOTS 8192
 typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
 // One visibility buffer per submission in flight, as many as command allocators: with 4, Age of Calamity (about twelve submissions a frame) waited in mtl_sub_begin for the previous frame's GPU work; its first battle went from 18.0 to 16.9 ms a frame on the Mac
@@ -586,11 +586,24 @@ static vis_buf g_vis_ring[VIS_RING]; static int g_vis_ring_n, g_vis_ring_i = -1;
 static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // This submission's visibility buffer and number of slots used
 static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].buf == b) return 1; return 0; }
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
-static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
+static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset whose submission's buffer is not reused yet
+static uint64_t g_vis_base, g_vis_folded;                // g_vis_base: the samples of slots folded since the last reset; g_vis_folded: slots folded in all (diagnostics)
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
-static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
+static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; g_vis_base = 0; }
+// A ring buffer is about to be reused, its submission complete: its slots' samples go into g_vis_base and the slots leave the list. The list held every counting pass since
+// the last reset, and a game that resets rarely or never made it grow for good: Breath of the Wild counts samples with one reset at the start, about 150 slots a frame, and the
+// list reached 4 million slots (64 MB, doubled on each realloc) in 10 minutes. A report after the buffer's reuse would also have read the new submission's samples in those slots.
+static void vis_fold(id<MTLBuffer> b) {
+    if (!b || !g_nvs) return;
+    const uint64_t *c = (const uint64_t *)b.contents; int k = 0;
+    for (int i = 0; i < g_nvs; i++) {
+        if (g_vs[i].buf == (__bridge void *)b) { g_vis_base += c[g_vs[i].slot]; g_vis_folded++; CFRelease(g_vs[i].buf); }
+        else g_vs[k++] = g_vs[i];
+    }
+    g_nvs = k;
+}
 static vis_list *vis_snapshot(void) {
-    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
+    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs; l->base = g_vis_base;
     for (int i = 0; i < g_nvs; i++) { l->s[i] = g_vs[i]; CFRetain(g_vs[i].buf); }
     return l;
 }
@@ -725,6 +738,7 @@ void mtl_sub_begin(void) {
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
     if (pick < 0 && g_vis_ring_n < VIS_RING) pick = g_vis_ring_n++;
     if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < VIS_RING; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait_at(oldest, UINT64_MAX, WS_VIS); }
+    vis_fold(g_vis_ring[pick].buf);   // complete: its fence has passed, or mtl_wait_at waited for it
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf;
@@ -1374,7 +1388,7 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
     for (int i = 0; i < n; i++) {
         if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
         else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
-            vis_list *l = ops[i].vis; uint64_t sum = 0;
+            vis_list *l = ops[i].vis; uint64_t sum = l->base;
             for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
             free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
         }
@@ -2331,6 +2345,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed "
            "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note)",
            vn, (unsigned long long)vh, (unsigned long long)vm, (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)mtl_tex_mis_count()); }
+    MLOG("occlusion query slots (samples passed): %d since the last reset not folded yet (list capacity %d), %llu folded in all; resets %llu, reports %llu",   // read off the submit thread: a diagnostic snapshot
+         g_nvs, g_vscap, (unsigned long long)g_vis_folded, (unsigned long long)g_cnt_reset[NVN_COUNTER_TYPE_SAMPLES_PASSED & 31], (unsigned long long)g_cnt_report[NVN_COUNTER_TYPE_SAMPLES_PASSED & 31]);
     if (g_allocprof > 0) { char ab[256]; int o = 0; for (int i = 0; i < g_alloc_n && o < 200; i++) o += snprintf(ab + o, sizeof ab - o, " #%d %llu MB", i, (unsigned long long)(g_alloc4[i].allocatedSize >> 20));
         for (int i = 0; i < 3 && o < 240; i++) o += snprintf(ab + o, sizeof ab - o, " up%d %llu pres%d %llu", i, (unsigned long long)(g_up_alloc4[i].allocatedSize >> 20), i, (unsigned long long)(g_present_alloc4[i].allocatedSize >> 20));
         MLOG("command allocator usage:%s", ab);
