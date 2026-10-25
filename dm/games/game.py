@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Game profiles: dm/games/<base game title ID>/game.tsv (key <TAB> values..., lines starting with # are comments) + the shader tables (and patches.py, the rewriter's patches of the game's builds) in the same folder. The shader tools, the host build, iOS packaging and the NSP script take each game's constants from here.
-# Usage: game.py list (list all profiles); game.py <id> <key> (print that key's value, for shell); game.py header <id> <out.h> (generate the host's game_profile.h);
+# Usage: game.py list (list all profiles); game.py <id> <key> [<default>] (print that key's value, for shell; without a default a missing key is an error); game.py header <id> <out.h> (generate the host's game_profile.h);
 #   game.py dir <id> (print the profile folder); game.py link <id> <link> (point a symlink at the profile folder: make cannot take paths with spaces)
 #   From Python: import game; g = game.load() (takes DM_GAME; there is no default game: unset is an error that lists the profiles); game.by_title(title ID); g.get / g.words / g.int / g.builds() / g.table(file name)
 # DM_GAMES_DIR (folders separated by ':') adds profile folders outside the repository, searched after dm/games: the NSP script writes a provisional profile for a game without one into
@@ -196,7 +196,7 @@ if __name__ == '__main__':
         if not (ln.is_symlink() and Path(os.readlink(ln)) == d):
             if ln.is_symlink() or ln.exists(): ln.unlink()
             ln.symlink_to(d)
-    elif len(a) == 2:
-        print(load(a[0]).get(a[1]))
+    elif len(a) in (2, 3):
+        print(load(a[0]).get(*a[1:]))
     else:
-        sys.exit(__doc__ or 'usage: game.py list | game.py <id> <key> | game.py header <id> <out.h> | game.py dir <id> | game.py link <id> <link>')
+        sys.exit(__doc__ or 'usage: game.py list | game.py <id> <key> [<default>] | game.py header <id> <out.h> | game.py dir <id> | game.py link <id> <link>')

@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -192,6 +193,36 @@ class Build(unittest.TestCase):
         with mock.patch.object(po.subprocess, 'run', fail), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
             po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work)])
         self.assertEqual(list(self.out.glob('*.mtl4a')), [])
+
+
+class Default(unittest.TestCase):
+    """Which games get an archive without DM_PSO_GPUS: build_ipa.sh's own lines, run with game.py's default form, so only a profile with pso_mtl4 on (the Metal 4 path, which alone
+    reads the archive on iOS) gets g18p; an explicit DM_PSO_GPUS wins, also when empty"""
+    def gpus(self, profile, **env):
+        sh = (REPO / 'dm/ios/tools/build_ipa.sh').read_text().splitlines()
+        i = next(n for n, ln in enumerate(sh) if ln.startswith('PSO=; P4='))
+        with tempfile.TemporaryDirectory() as d:
+            for k, v in profile.items(): Path(d, k).mkdir(); Path(d, k, 'game.tsv').write_text(v)
+            e = {k: v for k, v in os.environ.items() if k != 'DM_PSO_GPUS'}
+            e.update(env, DM=str(REPO / 'dm'), DM_GAMES_DIR=d, GD=d)
+            out = {}
+            for gid in profile:
+                r = subprocess.run(['bash', '-c', 'die() { echo "FAIL: $*"; exit 1; }\n' + '\n'.join(sh[i:i + 2]) + '\necho "$P4 $GPUS"'], env=dict(e, GAME=gid),
+                                   capture_output=True, text=True)
+                out[gid] = r.stdout.strip() if r.returncode == 0 else 'fail'
+            return out
+
+    def test_by_profile(self):
+        games = {'0100000000F0F000': 'title_id\t0100000000F0F000\npso_mtl4\ton\n', '0100000000F0F001': 'title_id\t0100000000F0F001\n',
+                 '0100000000F0F002': 'title_id\t0100000000F0F002\npso_mtl4\toff\n'}
+        self.assertEqual(self.gpus(games), {'0100000000F0F000': 'on g18p', '0100000000F0F001': 'off none', '0100000000F0F002': 'off none'})
+        self.assertEqual(self.gpus(games, DM_PSO_GPUS='g17p'), {'0100000000F0F000': 'on g17p', '0100000000F0F001': 'off g17p', '0100000000F0F002': 'off g17p'})
+        self.assertEqual(self.gpus(games, DM_PSO_GPUS='none')['0100000000F0F000'], 'on none')
+        self.assertEqual(self.gpus(games, DM_PSO_GPUS='')['0100000000F0F000'], 'on')
+
+    def test_breath_of_the_wild(self):   # the profile that turns the Metal 4 path on: its app gets the archive
+        r = subprocess.run([sys.executable, str(REPO / 'dm/games/game.py'), '01007EF00011E000', 'pso_mtl4', 'off'], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), 'on')
 
 
 if __name__ == '__main__':
