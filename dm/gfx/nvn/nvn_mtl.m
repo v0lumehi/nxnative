@@ -710,8 +710,9 @@ static void *g_sub_pool;
 static int tbdr_on(void);
 
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
+static __thread int t_in_sub;    // this thread is replaying a submission (frame pipelining stamps direct reads with its fence only there)
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    mtl_init(); g_sub_serial++; t_in_sub = 1; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     defer_drain();
     defer_reset();
     if (!g_warm_started && prepare_on()) shmap_load();   // the first submission: the prepare step (warm_start), before anything of it is encoded
@@ -1207,17 +1208,17 @@ static inline int pipe_on(void) {
     g_pipe = nvn_pipe_on(); if (g_pipe) { nvn_pipe_init(pipe_done_fence, dm_fault_in_guest); MLOG("frame pipelining: pool memory read directly is shadowed on pages the CPU rewrites and write-protected elsewhere"); }
     return g_pipe;
 }
-enum { PS_DIRECT, PS_SHADOW, PS_SHADOW_REUSED, PS_UBP, PS_GPU_WRITTEN, PS_UNTRACKED, PS_NOSHADOW, PS_N };
-static uint64_t g_ps[PS_N], g_ps_bytes;   // bindings by outcome; bytes copied into shadows
-static const char *const ps_name[PS_N] = {"direct", "shadow made", "shadow reused", "uniform shadow (queued updates)", "GPU-written: protected", "untracked: shadow", "not shadowable: protected"};
-enum { PSPAN_N = 1024, PSH_N = 256 };
+enum { PS_DIRECT, PS_MIRROR, PS_SHADOW, PS_SHADOW_REUSED, PS_UBP, PS_GPU_WRITTEN, PS_UNTRACKED, PS_NOSHADOW, PS_N };
+static uint64_t g_ps[PS_N], g_ps_bytes;   // bindings by outcome; bytes copied into shadows and mirrors
+static const char *const ps_name[PS_N] = {"direct", "page mirror", "shadow made", "shadow reused", "uniform shadow (queued updates)", "GPU-written: protected", "untracked: shadow", "not shadowable: protected"};
+enum { PSPAN_N = 1024, PSH_N = 1024 };
 static const void *g_pspan[PSPAN_N];   // tracked range by 64 KB of address (a hint nvn_pipe_span checks)
 static struct { uint64_t a, n, gpu, ready; uint32_t sub, npend, sbw; __unsafe_unretained id<MTLBuffer> buf; size_t off; } g_psh[PSH_N];   // this submission's shadows
 static const void *pipe_span(uint64_t a, uint64_t n) { unsigned k = (unsigned)((a >> 16) * 0x9E3779B97F4A7C15ull >> 54) & (PSPAN_N - 1); const void *s = nvn_pipe_span(g_pspan[k], a, a + n); g_pspan[k] = s; return s; }
 // The shadow of [a, a + n) as memory holds it now: GPU address, and the arena buffer / offset for a copy source (buf may be NULL)
 static uint64_t pipe_shadow(uint64_t a, uint64_t n, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
-    unsigned k = (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ n) >> 56) & (PSH_N - 1);
-    if (g_psh[k].sub == (uint32_t)g_sub_serial && g_psh[k].a == a && g_psh[k].n == n && g_psh[k].npend == (uint32_t)g_npend && g_psh[k].sbw == g_sbw_gen) {
+    unsigned k = (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ n) >> 54) & (PSH_N - 1);
+    if (g_psh[k].sub == (uint32_t)g_sub_serial && g_psh[k].a == a && g_psh[k].n == n) {   // (a range a write queued in this submission covers never gets here: pipe_read)
         g_ps[PS_SHADOW_REUSED]++; if (buf) { *buf = g_psh[k].buf; *off = g_psh[k].off; } return g_psh[k].gpu; }
     size_t lo = (size_t)(a & 255);   // the shadow keeps the address's low bits (element alignment of index and vertex data)
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)n + lo, &ab); uint8_t *d = (uint8_t *)ab.contents + o + lo;
@@ -1228,17 +1229,38 @@ static uint64_t pipe_shadow(uint64_t a, uint64_t n, __unsafe_unretained id<MTLBu
     if (buf) { *buf = ab; *off = o + lo; }
     return g_psh[k].gpu;
 }
+// Page mirrors: a hot range within one 16 KB page reads the submission's mirror of that page, filled 1 KB block by block as bindings need them (Breath of the Wild binds about
+// 5,000 small uniform ranges a frame over about 150 hot pages: one copy each cost the submit thread about 2 ms). A block, once copied, serves every later binding of the submission
+enum { PMR_N = 1024, PMR_PROBE = 8, PMR_BLK = 10 };
+typedef struct { uint64_t page, gpu; uint8_t *cpu; __unsafe_unretained id<MTLBuffer> buf; size_t off; uint32_t sub; uint16_t have; } pmr_ent;
+static pmr_ent g_pmr[PMR_N];
+static uint64_t g_pmr_blocks;
+static int pipe_mirror(uint64_t a, uint64_t n, uint64_t *gpu, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
+    uint64_t pg = a >> 14, base = pg << 14; uint32_t sub = (uint32_t)g_sub_serial;
+    if ((a + n - 1) >> 14 != pg) return 0;
+    pmr_ent *e = NULL; unsigned k = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 54) & (PMR_N - 1);
+    for (int i = 0; i < PMR_PROBE; i++, k = (k + 1) & (PMR_N - 1)) { pmr_ent *x = &g_pmr[k]; if (x->sub != sub) { e = x; e->page = 0; break; } if (x->page == pg) { e = x; break; } }
+    if (!e) return 0;
+    if (e->page != pg) { id<MTLBuffer> ab; size_t o = arena_alloc(16384, &ab); e->page = pg; e->sub = sub; e->have = 0; e->buf = ab; e->off = o; e->cpu = (uint8_t *)ab.contents + o; e->gpu = ab.gpuAddress + o; }
+    for (unsigned b = (unsigned)((a - base) >> PMR_BLK), b1 = (unsigned)((a + n - 1 - base) >> PMR_BLK); b <= b1; b++) if (!(e->have >> b & 1)) {
+        uint64_t lo = base + ((uint64_t)b << PMR_BLK); uint8_t *d = e->cpu + ((size_t)b << PMR_BLK);
+        memcpy(d, (const void *)(uintptr_t)lo, (size_t)1 << PMR_BLK);
+        if (ovl_on()) ovl_apply(d, lo, lo + ((uint64_t)1 << PMR_BLK), 0, 0);   // inline updates of submissions still running land in memory later: laid over
+        e->have |= (uint16_t)(1u << b); g_pmr_blocks++; g_ps_bytes += (uint64_t)1 << PMR_BLK; }
+    *gpu = e->gpu + (a - base); if (buf) { *buf = e->buf; *off = e->off + (size_t)(a - base); }
+    g_ps[PS_MIRROR]++; return 1;
+}
 // Ranges found cold and stamped in this submission, while no page has turned hot or cold since (nvn_pipe_epoch): bound again without looking at their pages
 enum { PRC_N = 4096 };
 static struct { uint64_t a, n; uint32_t sub, epoch; } g_prc[PRC_N];
 static inline unsigned prc_slot(uint64_t a, uint64_t n) { return (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ (n * 0xC2B2AE3D27D4EB4Full)) >> 52) & (PRC_N - 1); }
 // What a binding of [a, a + n) reads (gpu: memory's own address). shadow: the binding only reads (a write must reach memory: storage written by the shader, image atomics)
 static uint64_t pipe_read_buf(uint64_t a, uint64_t n, uint64_t gpu, int shadow, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
-    if (!pipe_on() || !a || !n) return gpu;
+    if (!pipe_on() || !a || !n || !t_in_sub) return gpu;   // outside a submission's replay (a texture resolved on another thread) there is no fence to stamp
     uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
     if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) { g_ps[PS_DIRECT]++; return gpu; }
     const void *span = pipe_span(a, n);
-    int hot = span ? nvn_pipe_hot(span, a, a + n) : -1;
+    int hot = span ? nvn_pipe_hot(span, a, a + n, shadow && n <= 65536) : -1;   // a small read-only range over pages no binding has read yet: hot at once (probed later), so the first write does not wait
     uint32_t fence = (uint32_t)(g_fence + 1);
     if (!hot) { nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_DIRECT]++; g_prc[k].a = a; g_prc[k].n = n; g_prc[k].sub = sub; g_prc[k].epoch = nvn_pipe_epoch(); return gpu; }
     if (!shadow) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_NOSHADOW]++; return gpu; }
@@ -1247,6 +1269,7 @@ static uint64_t pipe_read_buf(uint64_t a, uint64_t n, uint64_t gpu, int shadow, 
         uint64_t g; const uint8_t *c; if (!buf && n <= 65536 && ubp_get(a, a + n, &g, &c)) { g_ps[PS_UBP]++; return g; }
         if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_GPU_WRITTEN]++; return gpu; }
     if (hot < 0) g_ps[PS_UNTRACKED]++;
+    else { uint64_t g; if (pipe_mirror(a, n, &g, buf, off)) return g; }
     return pipe_shadow(a, n, buf, off);
 }
 // Whether a page of [a, a + n) is hot, through the same cache (a vertex stream bound over a large buffer: only a hot one is narrowed to the draw's vertices)
@@ -1254,17 +1277,17 @@ static int pipe_cold(uint64_t a, uint64_t n) {
     uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
     if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) return 1;
     const void *span = pipe_span(a, n);
-    return span && nvn_pipe_hot(span, a, a + n) == 0;
+    return span && nvn_pipe_hot(span, a, a + n, 0) == 0;
 }
 static inline uint64_t pipe_read(uint64_t a, uint64_t n, uint64_t gpu, int shadow) { return pipe_read_buf(a, n, gpu, shadow, NULL, NULL); }
 static void pipe_stats_line(void) {
-    static uint64_t prev[PS_N], prev_b, pd[12]; uint64_t d[12]; nvn_pipe_stats(d);
+    static uint64_t prev[PS_N], prev_b, prev_m, pd[13]; uint64_t d[13]; nvn_pipe_stats(d);
     char line[1200]; int o = snprintf(line, sizeof line, "frame pipelining, per frame over 300:");
     for (int i = 0; i < PS_N; i++) { o += snprintf(line + o, sizeof line - o, " %s %.1f;", ps_name[i], (g_ps[i] - prev[i]) / 300.0); prev[i] = g_ps[i]; }
-    o += snprintf(line + o, sizeof line - o, " shadow bytes %.2f MB; faults on read pages %.2f (stalled %.2f, %.3f ms; timeouts %llu; host writes %.2f), pages turned hot %.2f, probed %.2f, cooled %.2f, protected %.1f, hot ones protected again %.2f; hot list %llu",
-                  (g_ps_bytes - prev_b) / 300.0 / 1048576.0, (d[0] - pd[0]) / 300.0, (d[1] - pd[1]) / 300.0, (d[2] - pd[2]) / 300.0 / 1e6, (unsigned long long)d[3], (d[4] - pd[4]) / 300.0,
-                  (d[5] - pd[5]) / 300.0, (d[6] - pd[6]) / 300.0, (d[7] - pd[7]) / 300.0, (d[8] - pd[8]) / 300.0, (d[9] - pd[9]) / 300.0, (unsigned long long)d[10]);
-    prev_b = g_ps_bytes; memcpy(pd, d, sizeof pd);
+    o += snprintf(line + o, sizeof line - o, " copied %.2f MB (mirror blocks %.1f); faults on read pages %.2f (stalled %.2f, %.3f ms; timeouts %llu; host writes %.2f), pages turned hot by a write %.2f, unread taken hot %.2f, probed %.2f, cooled %.2f, hot for good %llu, protected %.1f, hot ones protected again %.2f; hot list %llu",
+                  (g_ps_bytes - prev_b) / 300.0 / 1048576.0, (g_pmr_blocks - prev_m) / 300.0, (d[0] - pd[0]) / 300.0, (d[1] - pd[1]) / 300.0, (d[2] - pd[2]) / 300.0 / 1e6, (unsigned long long)d[3], (d[4] - pd[4]) / 300.0,
+                  (d[5] - pd[5]) / 300.0, (d[11] - pd[11]) / 300.0, (d[6] - pd[6]) / 300.0, (d[7] - pd[7]) / 300.0, (unsigned long long)d[12], (d[8] - pd[8]) / 300.0, (d[9] - pd[9]) / 300.0, (unsigned long long)d[10]);
+    prev_b = g_ps_bytes; prev_m = g_pmr_blocks; memcpy(pd, d, sizeof pd);
     MLOG("%s", line);
 }
 // At each present (hle_nvn.c): the probes, and the counters every 300 presents
@@ -1535,7 +1558,7 @@ uint64_t mtl_sub_commit(void) {
     rec_signal(g_ev, fence);
     rec_drain();
     g_alloc_fence[g_alloc_cur] = fence;
-    g_cb = nil;
+    g_cb = nil; t_in_sub = 0;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
     return fence;
