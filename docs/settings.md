@@ -69,6 +69,7 @@ Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its worl
 - **When to change it:** turn it on if the picture looks soft and the device has GPU time to spare: on a Mac, or on an iPhone in handheld mode at 30 fps. For long sessions at 60 fps on an iPhone leave it at Standard.
 - **Cost:** GPU time each frame, which on an iPhone turns into heat: 2 to 5 ms on an iPhone 17 Pro Max (Breath of the Wild docked, 1920x1080 to 2346x1320; the game's own frame took 6 to 12 ms), and 0.4 to 1.3 ms on an M2 Max. With it, that iPhone held 60 fps docked for about 4 minutes from a cold start before it got thermally serious, and for about 1 minute from a warm one. Standard costs about 0.1 ms. Nothing changes while the game's picture is as large as the screen.
 - **On the Mac:** the Mac app has no settings screen; the line `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` turns it on (off by default). It helps in a large window or on a 4K screen.
+- **MetalFX before the HUD (`metalfx-scene`, Breath of the Wild docked, for testing):** with `DM_PRESENT_UPSCALE=metalfx-scene` in `env.txt`, the game composes its frames at the size of the screen's picture (2560x1440 on a 1440p screen) and MetalFX scales only the 3D world into it, from the game's 900p, after the game's own anti-aliasing. The HUD, the map and the menus are then drawn at the screen's resolution, sharp, and textures in the world keep the detail of that resolution. Everything else (handheld mode, other games) is scaled as with **MetalFX**. Set it before starting the game: the size is fixed at the start, so a window keeps the screen's size and is scaled down. On the Mac it takes about 180 MB more memory. Not offered in the iPhone's settings yet: it is untested there, and the iPhone's memory layout leaves room only for a picture up to about 1.5 times the 1080p area (an iPhone 17 Pro Max's 2346x1320 just fits).
 
 ### Frame buffering
 
@@ -184,7 +185,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
 | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
-| Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
+| Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx`, `metalfx-scene` (only from `env.txt`) |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
