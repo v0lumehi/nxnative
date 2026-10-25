@@ -640,7 +640,7 @@ __attribute__((weak)) uint64_t dm_main_off(const void *p) { (void)p; return ~0ul
 // CPU work, one frame in flight. A wait on work of the frame in progress (submitted after the last present: a readback) waits for it as before. The pages of pool memory the CPU
 // writes from frame to frame that the frame in flight reads directly are shadowed when it is replayed (nvn_mtl.m pipe_*), so the next frame's writes do not reach it
 static uint64_t g_pres_fence[8], g_npres;   // the queue's last fence at each present (any window)
-int nvn_pipe_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PIPELINE"); v = e && atoi(e) > 0; if (v) LOG("[nvn] frame pipelining (DM_NVN_PIPELINE): waits on the last presented frame's work wait for the frame before it"); } return v; }
+int nvn_pipe_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PIPELINE"); v = !e || atoi(e) > 0;   /* on by default; DM_NVN_PIPELINE=0 turns it off */ if (v) LOG("[nvn] frame pipelining (DM_NVN_PIPELINE): waits on the last presented frame's work wait for the frame before it"); } return v; }
 // DM_NVN_PIPE_TRACE=<first present>: logs, for 12 presents from there, each acquire, submit, present and SyncWait with its thread and fences (diagnostic)
 static void pipe_trace(const char *what, uint64_t a, uint64_t b) {
     static long from = -2; if (from == -2) { const char *e = getenv("DM_NVN_PIPE_TRACE"); from = e ? atol(e) : -1; }
