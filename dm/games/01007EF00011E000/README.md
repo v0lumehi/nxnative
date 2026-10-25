@@ -111,6 +111,7 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 
 General host changes first needed here; each applies to every game:
 
+- **Thermal cap** (`thermal_capped`, `DM_THERMAL_CAP`): [A thermally serious iPhone holds 30 fps](../../../docs/reference/frame-rate.md#a-thermally-serious-iphone-holds-30-fps).
 - **Pipeline keys omit disabled blend factors** (`pso_key_norm`): [Pipeline keys omit unused colour state](../../../docs/reference/shaders.md#pipeline-keys-omit-unused-colour-state).
 - **Resolved: GPU readback temporaries retained by a game thread's outer pool** (`mtl_read_texels`): [GPU readback without an autorelease pool](../../../docs/reference/memory.md#gpu-readback-without-an-autorelease-pool). Ported from MacNativeGames; checked here with a synthetic Metal readback lifetime test, without a new gameplay memory measurement.
 - **The host frame step in whole vsyncs** (`nvn_fstep.h`, `fstep_tick`, `FRAME_STEP` stubs, `fps_target`), explained in full under [Frame rate](#the-frame-step-current); its probes (`nvn_fstep_gpu_slowed`, `nvn_fstep_same`): [development.md, Power](../../../docs/development.md#power).
