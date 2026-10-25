@@ -66,8 +66,8 @@ flowchart LR
 
 Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its world at 900p and scales that to 1080p itself, before the app sees the picture. MetalFX works in either mode: handheld saves the most GPU time and heat, docked looks sharper than smooth scaling. Rendering at the screen's resolution stays the sharpest picture, where the GPU can afford it.
 
-- **When to change it:** turn it on if the picture looks soft, and especially in handheld mode, which keeps the iPhone cooler.
-- **Cost:** a little GPU time each frame (0.4 to 1.3 ms on an M2 Max; more on an iPhone, not measured yet). Nothing changes while the game's picture is as large as the screen.
+- **When to change it:** turn it on if the picture looks soft and the device has GPU time to spare: on a Mac, or on an iPhone in handheld mode at 30 fps. For long sessions at 60 fps on an iPhone leave it at Standard.
+- **Cost:** GPU time each frame, which on an iPhone turns into heat: 2 to 5 ms on an iPhone 17 Pro Max (Breath of the Wild docked, 1920x1080 to 2346x1320; the game's own frame took 6 to 12 ms), and 0.4 to 1.3 ms on an M2 Max. With it, that iPhone held 60 fps docked for about 4 minutes from a cold start before it got thermally serious, and for about 1 minute from a warm one. Standard costs about 0.1 ms. Nothing changes while the game's picture is as large as the screen.
 - **On the Mac:** the Mac app has no settings screen; the line `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` turns it on (off by default). It helps in a large window or on a 4K screen.
 
 ### Frame buffering
