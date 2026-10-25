@@ -238,8 +238,10 @@ void nvn_dirty_protect_all(void) {
 // replayed (the caller copies), or cold: write-protected, so the first CPU write faults, and the fault waits until the GPU work that read the page directly has completed (rf, the
 // low 32 bits of its fence) before the write goes through and the page turns hot. A page is classified (PF_KNOWN) the first time a binding reads it; a host write (a counter report,
 // a file read) forgets the classification, so the next direct read protects it again. Hot pages are probed a few a frame: protected again (PF_PROBE) while their bindings still
-// read shadows; one not written for PIPE_PROBE_FRAMES presents goes back to cold. Untracked memory (no range) is always shadowed by the caller
-enum { PF_KNOWN = 1, PF_HOT = 2, PF_PROBE = 4, PF_LISTED = 8 };
+// read shadows; one not written for PIPE_PROBE_FRAMES presents goes back to cold, and one that turns hot again after that (a ring the CPU writes every few frames, whose next write
+// waited for the GPU) stays hot. A page no binding has read yet can be taken as hot at once (nvn_pipe_hot adopt: small bindings), so its first write does not wait either; a probe
+// cools it when the CPU leaves it alone. Untracked memory (no range) is always shadowed by the caller
+enum { PF_KNOWN = 1, PF_HOT = 2, PF_PROBE = 4, PF_LISTED = 8, PF_COOLED = 16, PF_STICKY = 32 };   // COOLED: turned cold once; STICKY: turned hot again after that, never probed again
 enum { PIPE_RING = 16384, PIPE_PROBE_FRAMES = 4, PIPE_WAIT_MAX_MS = 250 };
 static uint64_t (*g_pipe_done)(void);   // the newest completed fence (nvn_mtl.m)
 static int (*g_pipe_guest)(void *uc);   // the faulting instruction is guest code (a host write never waits: it may be the thread that completes the fence)
@@ -247,9 +249,14 @@ static struct { range_t *_Atomic r; _Atomic uintptr_t p; } g_pipe_ring[PIPE_RING
 static _Atomic uint64_t g_pipe_ring_head, g_pipe_ring_tail;
 static _Atomic uint32_t g_pipe_epoch;   // bumped whenever a page turns hot or cold (the caller's caches of classified ranges)
 uint32_t nvn_pipe_epoch(void) { return atomic_load_explicit(&g_pipe_epoch, memory_order_acquire); }
-static _Atomic uint64_t g_ps_faults, g_ps_stalls, g_ps_stall_ns, g_ps_timeouts, g_ps_host, g_ps_hot, g_ps_probes, g_ps_demoted, g_ps_protected, g_ps_reprot;
+static _Atomic uint64_t g_ps_adopted, g_ps_sticky, g_ps_faults, g_ps_stalls, g_ps_stall_ns, g_ps_timeouts, g_ps_host, g_ps_hot, g_ps_probes, g_ps_demoted, g_ps_protected, g_ps_reprot;
 void nvn_pipe_init(uint64_t (*done)(void), int (*guest_pc)(void *uc)) { g_pipe_done = done; g_pipe_guest = guest_pc; g_pipe_on = 1; }
 static uint64_t mono_ns(void) { return mach_absolute_time() * g_tb.numer / g_tb.denom; }
+static void pipe_list(range_t *r, uintptr_t p) {   // a page turned hot joins the probe list at the next present (lock-free: also from the fault handler)
+    uint64_t h = atomic_load(&g_pipe_ring_head);
+    if (h - atomic_load(&g_pipe_ring_tail) < PIPE_RING && atomic_compare_exchange_strong(&g_pipe_ring_head, &h, h + 1)) {
+        atomic_fetch_or(&r->pf[p], PF_LISTED); atomic_store(&g_pipe_ring[h % PIPE_RING].p, p + 1); atomic_store(&g_pipe_ring[h % PIPE_RING].r, r); }
+}
 static void pipe_fault(range_t *r, uintptr_t p, void *uc) {
     if (!r->pf || p >= r->cap) return;
     uint8_t f = atomic_load(&r->pf[p]);
@@ -266,14 +273,10 @@ static void pipe_fault(range_t *r, uintptr_t p, void *uc) {
         }
         atomic_fetch_add(&g_ps_stalls, 1); atomic_fetch_add(&g_ps_stall_ns, mono_ns() - t0);
     }
-    uint8_t old = atomic_fetch_or(&r->pf[p], PF_HOT);
+    uint8_t old = atomic_fetch_or(&r->pf[p], PF_HOT | ((atomic_load(&r->pf[p]) & PF_COOLED) && !(atomic_load(&r->pf[p]) & PF_HOT) ? PF_STICKY : 0));
     atomic_fetch_and(&r->pf[p], (uint8_t)~PF_PROBE);
     if (!(old & PF_HOT)) { atomic_fetch_add(&g_ps_hot, 1); atomic_fetch_add(&g_pipe_epoch, 1); }
-    if (!(old & PF_LISTED)) {
-        uint64_t h = atomic_load(&g_pipe_ring_head);
-        if (h - atomic_load(&g_pipe_ring_tail) < PIPE_RING && atomic_compare_exchange_strong(&g_pipe_ring_head, &h, h + 1)) {
-            atomic_fetch_or(&r->pf[p], PF_LISTED); atomic_store(&g_pipe_ring[h % PIPE_RING].p, p + 1); atomic_store(&g_pipe_ring[h % PIPE_RING].r, r); }
-    }
+    if (!(old & PF_LISTED)) pipe_list(r, p);
 }
 static range_t *pipe_range(const void *span, uint64_t lo, uint64_t hi) {
     range_t *r = (range_t *)span;
@@ -281,12 +284,17 @@ static range_t *pipe_range(const void *span, uint64_t lo, uint64_t hi) {
     return r && r->pf ? r : NULL;
 }
 const void *nvn_pipe_span(const void *span, uint64_t lo, uint64_t hi) { return hi > lo ? pipe_range(span, lo, hi) : NULL; }
-// 1 when a page of [lo, hi) is hot (the binding reads a shadow), 0 when none is, -1 when the memory is not tracked
-int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi) {
+// 1 when a page of [lo, hi) is hot (the binding reads a shadow), 0 when none is, -1 when the memory is not tracked. adopt: pages no binding has read yet are taken as hot (listed for a probe)
+int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi, int adopt) {
     if (hi <= lo) return 0;
     range_t *r = pipe_range(span, lo, hi); if (!r) return -1;
-    for (uintptr_t i = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift; i <= q; i++) if (atomic_load_explicit(&r->pf[i], memory_order_relaxed) & PF_HOT) return 1;
-    return 0;
+    int hot = 0;
+    for (uintptr_t i = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift; i <= q; i++) {
+        uint8_t f = atomic_load_explicit(&r->pf[i], memory_order_relaxed);
+        if (f & PF_HOT) { if (!adopt) return 1; hot = 1; }
+        else if (adopt && !(f & PF_KNOWN)) { uint8_t o = atomic_fetch_or(&r->pf[i], PF_KNOWN | PF_HOT); if (!(o & PF_HOT)) { atomic_fetch_add(&g_ps_adopted, 1); atomic_fetch_add(&g_pipe_epoch, 1); } if (!(o & PF_LISTED)) pipe_list(r, i); hot = 1; }
+    }
+    return hot;
 }
 // [lo, hi) is read directly by the submission with this fence: every page of it protected (a hot one turns cold again), stamped with the fence
 void nvn_pipe_direct(const void *span, uint64_t lo, uint64_t hi, uint32_t fence) {
@@ -322,9 +330,9 @@ void nvn_pipe_frame(void) {
         if (g_plcur >= g_npl) g_plcur = 0;
         pipe_ent *e = &g_pl[g_plcur];
         uint8_t f = e->p < e->r->cap && atomic_load(&e->r->live) ? atomic_load(&e->r->pf[e->p]) : 0;
-        if (!(f & PF_HOT)) { if (e->p < e->r->cap) atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~PF_LISTED); g_pl[g_plcur] = g_pl[--g_npl]; continue; }   // turned cold by a direct read, or the pool went
+        if (!(f & PF_HOT) || (f & PF_STICKY)) { if (e->p < e->r->cap) atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~PF_LISTED); if (f & PF_STICKY) atomic_fetch_add(&g_ps_sticky, 1); g_pl[g_plcur] = g_pl[--g_npl]; continue; }   // turned cold by a direct read, the pool went, or hot for good
         if (f & PF_PROBE) {
-            if (g_pl_frame - e->at >= PIPE_PROBE_FRAMES) { atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~(PF_HOT | PF_PROBE | PF_LISTED)); atomic_fetch_add(&g_ps_demoted, 1); atomic_fetch_add(&g_pipe_epoch, 1); g_pl[g_plcur] = g_pl[--g_npl]; continue; }
+            if (g_pl_frame - e->at >= PIPE_PROBE_FRAMES) { atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~(PF_HOT | PF_PROBE | PF_LISTED)); atomic_fetch_or(&e->r->pf[e->p], PF_COOLED); atomic_fetch_add(&g_ps_demoted, 1); atomic_fetch_add(&g_pipe_epoch, 1); g_pl[g_plcur] = g_pl[--g_npl]; continue; }
         } else if (budget) {
             budget--; atomic_fetch_or(&e->r->pf[e->p], PF_PROBE); protect_pages(e->r, e->p, e->p); e->at = g_pl_frame; atomic_fetch_add(&g_ps_probes, 1);
         } else break;
@@ -332,8 +340,8 @@ void nvn_pipe_frame(void) {
     }
     pthread_mutex_unlock(&g_pl_mu);
 }
-void nvn_pipe_stats(uint64_t s[12]) {
+void nvn_pipe_stats(uint64_t s[13]) {
     s[0] = g_ps_faults; s[1] = g_ps_stalls; s[2] = g_ps_stall_ns; s[3] = g_ps_timeouts; s[4] = g_ps_host; s[5] = g_ps_hot; s[6] = g_ps_probes; s[7] = g_ps_demoted; s[8] = g_ps_protected; s[9] = g_ps_reprot;
-    pthread_mutex_lock(&g_pl_mu); s[10] = g_npl; pthread_mutex_unlock(&g_pl_mu); s[11] = 0;
+    pthread_mutex_lock(&g_pl_mu); s[10] = g_npl; pthread_mutex_unlock(&g_pl_mu); s[11] = g_ps_adopted; s[12] = g_ps_sticky;
 }
 static void pipe_epoch_bump(void) { atomic_fetch_add(&g_pipe_epoch, 1); }

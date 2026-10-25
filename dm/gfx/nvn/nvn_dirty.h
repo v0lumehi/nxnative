@@ -20,8 +20,8 @@ void nvn_dirty_fault_log(int on); uint64_t nvn_dirty_fault_take(uintptr_t *out, 
 // Frame pipelining (DM_NVN_PIPELINE; nvn_dirty.c "Frame pipelining", nvn_mtl.m pipe_*): pages a binding reads directly are protected (cold) or shadowed by the caller (hot)
 void nvn_pipe_init(uint64_t (*done)(void), int (*guest_pc)(void *uc));   // done: the newest completed fence; guest_pc: whether a fault's instruction is guest code
 const void *nvn_pipe_span(const void *span, uint64_t lo, uint64_t hi);    // the tracked range holding [lo, hi) (span: a kept handle to check first), NULL = untracked
-int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi);             // 1: a page of [lo, hi) is hot (read a shadow), 0: none is, -1: untracked memory
+int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi, int adopt);  // 1: a page of [lo, hi) is hot (read a shadow), 0: none is, -1: untracked memory; adopt: unread pages count as hot
 void nvn_pipe_direct(const void *span, uint64_t lo, uint64_t hi, uint32_t fence);   // [lo, hi) is read directly by the submission with this fence: protected and stamped
 uint32_t nvn_pipe_epoch(void);                                            // changes whenever a page turns hot or cold
 void nvn_pipe_frame(void);                                                 // at each present: probes hot pages, turns unwritten ones cold
-void nvn_pipe_stats(uint64_t s[12]);   // cumulative: faults on classified pages, of them stalls, stall ns, timeouts, host writes, pages turned hot, probes, demoted, pages protected, hot pages protected again; hot list size
+void nvn_pipe_stats(uint64_t s[13]);   // cumulative: faults on classified pages, of them stalls, stall ns, timeouts, host writes, pages turned hot by a write, probes, cooled, pages protected, hot pages protected again; hot list size; pages adopted hot unread; pages hot for good
