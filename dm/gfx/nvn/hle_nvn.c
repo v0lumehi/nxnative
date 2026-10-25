@@ -1755,6 +1755,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         int lag = 0; for (int i = 0; i < lag_k; i++) if (o->presents % (uint64_t)lag_n[i] < (uint64_t)lag_run[i]) lag += lag_ms[i];
         if (lag) usleep((useconds_t)lag * 1000);
     }
+    {   // DM_NVN_WPROBE=1 (diagnostic): every tracked pool page is write-protected at each present, and the faults until the next one count the pages the CPU writes in a
+        // frame (16 KB pages; the protecting itself costs time, so frame times do not count in such a run)
+        static int wp = -1; static uint64_t f0, acc, accp, nfr; if (wp < 0) wp = getenv("DM_NVN_WPROBE") != NULL;
+        if (wp) { uint64_t fa, pr; nvn_dirty_stats(&fa, &pr); if (nfr++) { acc += fa - f0; } uint64_t m0 = now_ns(); nvn_dirty_protect_all(); accp += now_ns() - m0; nvn_dirty_stats(&f0, &pr);
+            if (nfr % 300 == 0) { LOG("[wprobe] up to present %llu: the CPU wrote %.1f tracked pages a frame (%.2f MB), protecting all took %.2f ms a frame", (unsigned long long)o->presents, acc / 299.0, acc / 299.0 * 16384 / 1048576.0, accp / 300.0 / 1e6); acc = accp = 0; nfr = 1; } }
+    }
     gfx_enter();
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // enqueue only, return immediately
