@@ -743,31 +743,46 @@ static inline void m4_end(id e) {
 // later work, so the next pass's vertex work can overlap this pass's fragments (with the full barriers every pass waited for the previous one to finish completely: about 350 passes a frame in Breath of
 // the Wild). The next draw pass adds the full consumer barrier when the game called nvnCommandBufferBarrier since the last one (NVN asks for one before results of rendering are read as textures, shader data or
 // indirect arguments), or when anything other than a draw pass ran in between (compute, copies and uploads keep their full barriers). Only vertex-stage reads of the previous pass's results without a barrier change order
-static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strcmp(e, "game"); if (v) MLOG("DM_NVN_BARRIER=game: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments)"); } return v; }
+// DM_NVN_BARRIER=ab... alternates game and full with the DM_AB phases (measurement)
+static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
+static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strncmp(e, "ab", 2) ? sw_mode("DM_NVN_BARRIER", 0) : e && !strcmp(e, "game"); if (v == 1) MLOG("DM_NVN_BARRIER=game: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments)"); } return sw_on(v); }
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = g_bar_skip; *full = g_bar_full; }
 uint64_t mtl_cut_count(void);
 // DM_NVN_GPUPROF=first frame[-last frame] (diagnostic): GPU time of every encoder of the main command buffers in those frames. A relaxed timestamp is written into a counter heap when an
 // encoder begins (before its first draw or dispatch) and when it ends (after its fragment stage); nothing is serialized beyond the barriers the replay already sets, so the frame runs
-// as usual. Printed as "[gpuprof]" lines (one per encoder, then the frame's sum by kind and size) once the frame's last command buffer completes
+// as usual. Printed as "[gpuprof]" lines once the frame's last command buffer completes: one per encoder, then a frame line with the render and compute / copy time, the attachment
+// traffic and the span from the first start to the last end. dm/tools/gpuprof.py sums them by pass shape.
+// DM_NVN_GPUPROF=every:<n> profiles one frame in every n (frames that are multiples of n), each reported on its own: for a device run whose scene cannot be timed to a frame number.
+// A render pass line also gives what it loaded and stored of its attachments (KB, the bandwidth ledger's view: DontCare stores are not counted) and the Metal pixel formats of
+// colour attachment 0 and of the depth / stencil attachment (0: none)
 enum { GP_MAX = 4096 };   // the largest timestamp heap Metal makes
-typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
-static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1; static uint64_t g_gp_frame;
+typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; uint32_t ld_kb, st_kb; uint16_t cfmt, dfmt; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
+static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1, g_gp_every; static uint64_t g_gp_frame;
+static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
+static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
 static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
-    if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF"); g_gp_f0 = e ? atol(e) : -1; g_gp_f1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_gp_f0; if (g_gp_f0 < 0) return 0; }
-    long f = (long)atomic_load(&g_cur_frame); return f >= g_gp_f0 && f <= g_gp_f1;
+    if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
+        if (e && !strncmp(e, "every:", 6)) { g_gp_every = atol(e + 6); g_gp_f0 = g_gp_every > 0 ? 0 : -1; if (g_gp_every > 0) MLOG("DM_NVN_GPUPROF: one frame in every %ld profiled", g_gp_every); }
+        else { g_gp_f0 = e ? atol(e) : -1; g_gp_f1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_gp_f0; }
+        if (g_gp_f0 < 0) return 0; }
+    long f = (long)atomic_load(&g_cur_frame);
+    if (g_gp_every > 0) return f > 0 && f % g_gp_every == 0;
+    return f >= g_gp_f0 && f <= g_gp_f1;
 }
 static void gp_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right after an encoder of the main command buffer is made
+    if (g_gp_every > 0 && g_gp_state == 2 && !atomic_load(&g_gp_busy)) g_gp_state = 0;   // the previous periodic profile has been reported
     if (!gp_active() || g_gp_state == 2) return;
     if (!g_gp_heap) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = GP_MAX; NSError *er = nil;
         g_gp_heap = [g_dev newCounterHeapWithDescriptor:hd error:&er]; if (!g_gp_heap) { MLOG("[RED] GPUPROF: no counter heap: %s", er.description.UTF8String); g_gp_f0 = -1; return; } }
     if (!g_gp_state) { g_gp_state = 1; g_gp_n = 0; g_gp_frame = atomic_load(&g_cur_frame); [g_gp_heap invalidateCounterRange:NSMakeRange(0, GP_MAX)]; }
     if (2 * g_gp_n + 2 > GP_MAX) return;
-    gp_lab l = {kind, 0, 0, 0, 0, 0, kind == 'R' ? (uint32_t)g_stat_draw : g_gp_copies, g_seg, g_stat_pass}; if (kind != 'R') { l.w = (uint16_t)g_gp_disp; l.h = (uint16_t)g_gp_ubd; }
+    gp_lab l = {kind, 0, 0, 0, 0, 0, kind == 'R' ? (uint32_t)g_stat_draw : g_gp_copies, g_seg, g_stat_pass, 0, 0, 0, 0}; if (kind != 'R') { l.w = (uint16_t)g_gp_disp; l.h = (uint16_t)g_gp_ubd; }
     if (d) { for (int i = 0; i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i]; if (!c.texture) continue;
-            l.nc++; l.w = (uint16_t)MAX(c.texture.width >> c.level, 1); l.h = (uint16_t)MAX(c.texture.height >> c.level, 1); l.loads += c.loadAction == MTLLoadActionLoad; }
+            if (!l.nc) l.cfmt = (uint16_t)c.texture.pixelFormat; l.nc++; l.w = (uint16_t)MAX(c.texture.width >> c.level, 1); l.h = (uint16_t)MAX(c.texture.height >> c.level, 1); l.loads += c.loadAction == MTLLoadActionLoad; }
         MTLRenderPassDepthAttachmentDescriptor *z = d.depthAttachment;
+        if (z.texture || d.stencilAttachment.texture) l.dfmt = (uint16_t)(z.texture ? z.texture : d.stencilAttachment.texture).pixelFormat;
         if (z.texture) { l.depth = 1; l.w = (uint16_t)MAX(z.texture.width >> z.level, 1); l.h = (uint16_t)MAX(z.texture.height >> z.level, 1); l.loads += z.loadAction == MTLLoadActionLoad; } }
     g_gp_lab[g_gp_n] = l; g_gp_cur = g_gp_n;
     if (kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageVertex intoHeap:g_gp_heap atIndex:2 * g_gp_n];
@@ -776,25 +791,28 @@ static void gp_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right 
 }
 static void gp_end(id e) {   // right before that encoder ends
     if (g_gp_cur < 0) return;
-    int k = g_gp_cur; g_gp_cur = -1; if (g_gp_lab[k].kind == 'R') g_gp_lab[k].draws = (uint32_t)g_stat_draw - g_gp_lab[k].draws; else { g_gp_lab[k].draws = g_gp_copies - g_gp_lab[k].draws; g_gp_lab[k].w = (uint16_t)(g_gp_disp - g_gp_lab[k].w); g_gp_lab[k].h = (uint16_t)(g_gp_ubd - g_gp_lab[k].h); }
+    int k = g_gp_cur; g_gp_cur = -1;
+    if (g_gp_lab[k].kind == 'R') { g_gp_lab[k].ld_kb = (uint32_t)((g_bw_load - g_gp_bw_l0) >> 10); g_gp_lab[k].st_kb = (uint32_t)((g_bw_store - g_gp_bw_s0) >> 10); }   // since the previous pass end (rp_end); sd_finish has set the stores
+    if (g_gp_lab[k].kind == 'R') g_gp_lab[k].draws = (uint32_t)g_stat_draw - g_gp_lab[k].draws; else { g_gp_lab[k].draws = g_gp_copies - g_gp_lab[k].draws; g_gp_lab[k].w = (uint16_t)(g_gp_disp - g_gp_lab[k].w); g_gp_lab[k].h = (uint16_t)(g_gp_ubd - g_gp_lab[k].h); }
     if (g_gp_lab[k].kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment intoHeap:g_gp_heap atIndex:2 * k + 1];
     else [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:g_gp_heap atIndex:2 * k + 1];
 }
 static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's last command buffer has completed
-    NSData *r = [g_gp_heap resolveCounterRange:NSMakeRange(0, 2 * n)]; const uint64_t *t = r.bytes; if (!t) { free(lab); return; }
-    double tick_ns = 1e9 / (double)[g_dev queryTimestampFrequency], tot[2] = {0}, span = 0; uint64_t t0 = 0, t1 = 0;
+    NSData *r = [g_gp_heap resolveCounterRange:NSMakeRange(0, 2 * n)]; const uint64_t *t = r.bytes; if (!t) { free(lab); atomic_store(&g_gp_busy, 0); return; }
+    double tick_ns = 1e9 / (double)[g_dev queryTimestampFrequency], tot[2] = {0}, span = 0; uint64_t t0 = 0, t1 = 0, ld = 0, st = 0; int np = 0;
     for (int i = 0; i < n; i++) { uint64_t a = t[2 * i], b = t[2 * i + 1]; if (!a || !b || b < a) continue;
         double us = (b - a) * tick_ns / 1e3; const gp_lab *l = &lab[i]; tot[l->kind != 'R'] += us;
         if (!t0 || a < t0) t0 = a; if (b > t1) t1 = b;
-        if (l->kind == 'R') MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg);
+        if (l->kind == 'R') { np++; ld += l->ld_kb; st += l->st_kb;
+            MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u load %u KB store %u KB fmt %u/%u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg, l->ld_kb, l->st_kb, l->cfmt, l->dfmt); }
         else MLOG("[gpuprof] F%llu %4d %8.1f us compute / copy after pass %llu start %+.1f seg %u copies %u (uniform updates %u) dispatches %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, (a - t[0]) * tick_ns / 1e3, l->seg, l->draws, l->h, l->w); }
     span = (t1 - t0) * tick_ns / 1e3;
-    MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders, first start to last end %.2f ms", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, span / 1e3);
-    free(lab);
+    MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders (%d render passes, attachments load %.1f MB store %.1f MB), first start to last end %.2f ms", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, np, ld / 1024.0, st / 1024.0, span / 1e3);
+    free(lab); atomic_store(&g_gp_busy, 0);
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d];
-    if (g_last_end_relaxed && !g_game_barrier) g_bar_skip++;
+    if (g_last_end_relaxed && !g_game_barrier && barrier_game()) g_bar_skip++;
     else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; g_bar_full++; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
@@ -1213,7 +1231,8 @@ static int ub_skip(const char *key) {   // Whether this phase should drop draws 
     for (int i = 0; i < g_ub_nk[uc]; i++) { const char *k = g_ub_keys[uc][i]; if (k[0] == '@') continue; if (k[0] == '*' || !strncmp(key, k, strlen(k))) return 1; }
     return 0;
 }
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); }
+static long ab_len(void); static void ab_frame(uint64_t f);
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
 static void gpu_tag_begin(uint64_t f) {
@@ -1288,7 +1307,7 @@ uint64_t mtl_sub_commit(void) {
     }];
     void arena_commit(uint64_t fence); arena_commit(fence);
     res_commit();
-    if (g_gp_state == 1 && !gp_active()) { int gn = g_gp_n; gp_lab *gl = malloc(sizeof(gp_lab) * (gn ? gn : 1)); memcpy(gl, g_gp_lab, sizeof(gp_lab) * gn); uint64_t gf = g_gp_frame; g_gp_state = 2;
+    if (g_gp_state == 1 && !gp_active()) { int gn = g_gp_n; gp_lab *gl = malloc(sizeof(gp_lab) * (gn ? gn : 1)); memcpy(gl, g_gp_lab, sizeof(gp_lab) * gn); uint64_t gf = g_gp_frame; g_gp_state = 2; atomic_store(&g_gp_busy, 1);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; gp_report(gn, gl, gf); }]; }
     [g_cb endCommandBuffer];
     rec_commit(g_cb, o);
@@ -2254,15 +2273,20 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
 static int g_kd_force;   // the draw DM_NVN_KEYDUMP matched: force the per-binding records on (see kd_draw)
-static _Atomic long g_pd_a0 = -2, g_pd_a1;   // the frames dumped (inclusive); -2 = DM_NVN_PASSDUMP not read yet
+static _Atomic long g_pd_a0 = -2, g_pd_a1;   // the frames dumped (inclusive); -2 = DM_NVN_PASSDUMP not read yet, -3 = DM_NVN_PASSDUMP=every:<n>
+static long g_pd_every;
 static inline int passdump(void) {
     if (g_kd_force) return 1;
 #ifdef NVN_RT_RANGE_TEST
     if (g_rr_checking) return 0;
 #endif
     if (__builtin_expect(g_pd_a0 == -1, 1)) return 0;   // off (the usual case): answered first, it is asked for every binding of every draw
-    if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : e ? atol(e) : -1; g_pd_a0 = e ? atol(e) : -1; }
-    long f = (long)atomic_load(&g_cur_frame), a0 = g_pd_a0; return a0 >= 0 && f >= a0 && f <= g_pd_a1;
+    if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP");
+        if (e && !strncmp(e, "every:", 6)) { g_pd_every = atol(e + 6); g_pd_a1 = -1; g_pd_a0 = g_pd_every > 0 ? -3 : -1; }   // one frame in every n, halfway between two DM_NVN_GPUPROF=every:n frames
+        else { g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : e ? atol(e) : -1; g_pd_a0 = e ? atol(e) : -1; } }
+    long f = (long)atomic_load(&g_cur_frame), a0 = g_pd_a0;
+    if (a0 == -3) return f > 0 && f % g_pd_every == g_pd_every / 2;
+    return a0 >= 0 && f >= a0 && f <= g_pd_a1;
 }
 // The next n frames' passes, on request (the Mac's DM_CTL "passdump n", hle_hid.c): for a scene that a fixed DM_NVN_PASSDUMP frame range cannot be timed to
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
@@ -2430,6 +2454,68 @@ static int udc_on(void) {
 //   so the inference would miss readers - e.g. deciding an attachment is never read afterwards and not storing it. Turn them back on once they recognize bindless readers.
 static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"); v = e && !strcmp(e, "1"); if (!v) MLOG("TBDR optimizations off by default (this game uses bindless textures; DM_NVN_TBDR=1 turns them on)"); } return v; }
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // Narrow candidate, off by default
+// ---------- In-process A/B phases (DM_AB, measurement) ----------
+// DM_AB=<frames> splits the run into phases of that many frames (frame f is in phase f / frames) and alternates the switches whose value is ab (sw_mode; DM_NVN_BARRIER=ab so far):
+// ab = on in every second phase (phase 0 with all of them off), ab:<k>[,<k>...]/<n> = on in the phases whose number modulo n is one of the k (four configurations of two switches: one
+// ab:1,3/4, the other ab:2,3/4). Both configurations then run in the same process, scene and thermal state, which separate runs on a phone cannot give. A switch reads its mode once
+// (sw_mode) and asks sw_on at each use; one that must stay the same over a pass latches it when the pass begins
+static _Atomic long g_ab_phase; static long g_ab_len = -1;
+static long ab_len(void) { if (g_ab_len < 0) { const char *e = getenv("DM_AB"); g_ab_len = e ? atol(e) : 0; if (g_ab_len < 0) g_ab_len = 0; if (g_ab_len) MLOG("DM_AB: switches set to ab alternate every %ld frames (phase 0 with all of them off)", g_ab_len); } return g_ab_len; }
+enum { SW_MAX = 8 }; static const char *g_sw_name[SW_MAX]; static int g_sw_mode[SW_MAX], g_sw_n;
+static inline int sw_on_at(int m, long ph) { if (m < 2) return m; int n = (m - 2) & 15, mask = (m - 2) >> 4; return mask >> (ph % n) & 1; }
+// The mode of switch <name>: 0 off, 1 on, 2 + n + 16 * mask = on in the phases whose number modulo n is in mask; ab without DM_AB is off
+static int sw_mode(const char *name, int dflt) {
+    const char *e = getenv(name); int m = dflt, mask = 2, n = 2;
+    if (e && !strncmp(e, "ab", 2)) {
+        if (e[2] == ':') { const char *sl = strchr(e, '/'); int nn = sl ? atoi(sl + 1) : 0, mk = 0;
+            for (const char *q = e + 3; sl && q < sl; ) { int k = atoi(q); if (k >= 0 && k < 15) mk |= 1 << k; while (q < sl && *q != ',') q++; if (q < sl) q++; }
+            if (nn >= 2 && nn <= 15 && mk && mk < (1 << nn)) { mask = mk; n = nn; } }
+        m = ab_len() ? 2 + n + 16 * mask : 0;
+        if (!ab_len()) MLOG("[RED] %s=%s needs DM_AB=<frames>: the switch is off", name, e); }
+    else if (e) m = atoi(e) ? 1 : 0;
+    if (m >= 2) MLOG("%s: on in the DM_AB phases whose number modulo %d is in the set %#x", name, n, mask);
+    if (g_sw_n < SW_MAX) { g_sw_name[g_sw_n] = name; g_sw_mode[g_sw_n++] = m; }
+    return m;
+}
+static inline int sw_on(int m) { return sw_on_at(m, atomic_load_explicit(&g_ab_phase, memory_order_relaxed)); }
+// Each phase is reported once its frames' GPU times have arrived (8 frames late) as an [ab] line: the switches on in it, GPU time and whole frame time (p50 / p90 / mean over the phase
+// without its first quarter, while the GPU clock and the frame step settle), and attachment traffic and render passes per frame (the bandwidth ledger)
+enum { AB_MAXF = 4096 };
+static float g_ab_gpu[AB_MAXF], g_ab_fr[AB_MAXF]; static int g_ab_nf; static long g_ab_ph = -1; static uint64_t g_ab_bw0[2], g_ab_pass0, g_ab_f0;
+static uint64_t g_ab_bw1[2], g_ab_pass1, g_ab_f1;   // the counters at the switch to the current phase (taken in ab_frame), copied to *0 when the previous phase is reported
+static int flt_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
+static void ab_frame(uint64_t f) {   // frame f begins (mtl_set_frame): the phase follows the frame number
+    long ph = (long)(f / (uint64_t)g_ab_len);
+    if (atomic_load(&g_ab_phase) != ph || f % (uint64_t)g_ab_len == 0) { g_ab_bw1[0] = g_bw_load; g_ab_bw1[1] = g_bw_store; g_ab_pass1 = g_stat_pass; g_ab_f1 = f; }
+    atomic_store(&g_ab_phase, ph);
+}
+static void ab_report(long ph) {
+    int n = g_ab_nf, skip = n / 4, m = n - skip; if (m < 10) return;
+    float *g = malloc(sizeof(float) * (size_t)m), *fr = malloc(sizeof(float) * (size_t)m); double gs = 0, fs = 0;
+    for (int i = 0; i < m; i++) { g[i] = g_ab_gpu[skip + i]; fr[i] = g_ab_fr[skip + i]; gs += g[i]; fs += fr[i]; }
+    qsort(g, (size_t)m, sizeof *g, flt_cmp); qsort(fr, (size_t)m, sizeof *fr, flt_cmp);
+    double nf = g_ab_f1 > g_ab_f0 ? (double)(g_ab_f1 - g_ab_f0) : 1;
+    char on[160] = ""; size_t o = 0;
+    for (int i = 0; i < g_sw_n && o < sizeof on; i++) if (g_sw_mode[i] >= 2 && sw_on_at(g_sw_mode[i], ph)) {
+        const char *nm = g_sw_name[i]; if (!strncmp(nm, "DM_NVN_", 7)) nm += 7; else if (!strncmp(nm, "DM_", 3)) nm += 3;
+        o += (size_t)snprintf(on + o, sizeof on - o, "%s%s", o ? "," : "", nm); }
+    MLOG("[ab] phase %ld %s: %d frames, GPU p50 %.2f / p90 %.2f / mean %.2f ms, frame p50 %.2f / p90 %.2f / mean %.2f ms; per frame: attachments load %.0f MB store %.0f MB, passes %.1f",
+         ph, o ? on : "base", m, g[m / 2], g[m * 9 / 10], gs / m, fr[m / 2], fr[m * 9 / 10], fs / m,
+         (g_ab_bw1[0] - g_ab_bw0[0]) / nf / 1048576.0, (g_ab_bw1[1] - g_ab_bw0[1]) / nf / 1048576.0, (g_ab_pass1 - g_ab_pass0) / nf);
+    free(g); free(fr);
+}
+// Once per frame with that frame's GPU time and whole frame time (hle_nvn.c, 8 frames late); the phase is the one frame f ran in
+void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) {
+    if (!ab_len()) return;
+    long ph = (long)(f / (uint64_t)g_ab_len);
+    if (ph != g_ab_ph) {
+        if (g_ab_ph >= 0) ab_report(g_ab_ph);
+        g_ab_ph = ph; g_ab_nf = 0;
+        memcpy(g_ab_bw0, g_ab_bw1, sizeof g_ab_bw0); g_ab_pass0 = g_ab_pass1; g_ab_f0 = g_ab_f1;
+    }
+    if (g_ab_nf < AB_MAXF) { g_ab_gpu[g_ab_nf] = (float)gpu_ms; g_ab_fr[g_ab_nf] = (float)frame_ms; g_ab_nf++; }
+}
+
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
 // ---------- Cross-submission attachment validity ledger ----------
 // Entry = subresource (texture serial, level, layer) + state, surviving across submissions:
@@ -2530,7 +2616,8 @@ static void rp_end(void) { if (g_enc) { AP_B;
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
-    sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+    sd_finish(); enc_r_end_pass(g_enc); g_gp_bw_l0 = g_bw_load; g_gp_bw_s0 = g_bw_store;   // the profile's per-pass ledger counts from the previous pass end, profiled or not
+    zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
 #ifdef NVN_RT_RANGE_TEST
