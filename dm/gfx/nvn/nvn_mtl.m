@@ -8527,6 +8527,7 @@ static void sub_cut(void) {
     res_commit();
     [g_cb endCommandBuffer];
     rec_commit(g_cb, o);
+    if (rec_on()) rec_publish();   // the segment reaches the encode thread now, not when its block of records fills
     g_cb = rec_cb_new();
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];   // one allocator encodes several command buffers in sequence; it is reset only once its fence (the last segment) has passed, when a later submission starts
     g_cut_draw0 = g_stat_draw;
