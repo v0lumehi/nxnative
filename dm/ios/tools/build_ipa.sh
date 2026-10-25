@@ -79,6 +79,20 @@ else cp "$GD/shader_map.tsv" "$GD/pso_manifest.tsv" "$GD/c1_full.tsv" Gen/dm/ ||
   if [ -f "$GD/cb_extent.tsv" ]; then cp "$GD/cb_extent.tsv" Gen/dm/ || die "copy cb_extent.tsv"; else t "no $GD/cb_extent.tsv: the host copies whole uniform bindings"; fi
   # the shader pairs, beside the shader map where the pipeline prebuild reads them (nvn_mtl.m pso_prebuild): without them the app makes no pulling bases, and a hybrid draw has no stand-in
   for f in shader_pairs.tsv pso_pairs.tsv; do if [ -f "$GD/$f" ]; then cp "$GD/$f" Gen/dm/ || die "copy $f"; fi; done; fi   # optional
+# The pipeline archive made offline (dm/gfx/tools/pso_offline.py): the base of every shader pair, compiled here by metal-tt for each GPU architecture in DM_PSO_GPUS (comma-separated:
+# g18p = A19 / A19 Pro; none = no archive), so the device does not build them on its first start (Breath of the Wild: 15,767 bases, 7-8 minutes on an iPhone 17 Pro Max).
+# Only the Metal 4 path reads it, which iOS turns on for a game whose profile sets pso_mtl4 on: the default is g18p for such a game and none for the others (their app would carry
+# it unread). It goes into the app as pso/ (main.m hands it to the host as DM_PSO_BUNDLE), with the pulling vertex libraries the bases are made of. Each architecture adds about
+# 650 MB to the app (Breath of the Wild; 220 MB in the IPA) and 4 minutes to the first build; made again only when its inputs change (the libraries, the pairs, the profile's depth_mode, metal-tt)
+PSO=; P4=$(python3 "$DM/games/game.py" "$GAME" pso_mtl4 off) || die "game profile $GD: pso_mtl4"
+if [ -n "${DM_PSO_GPUS+set}" ]; then GPUS=$DM_PSO_GPUS; elif [ "$P4" = on ]; then GPUS=g18p; else GPUS=none; fi
+if [ "$GFXAPI" = nvn ] && [ -n "$GPUS" ] && [ "$GPUS" != none ] && [ -f "$GD/shader_pairs.tsv" ]; then
+  PSO=$W/build/ios/pso/bundle
+  t "pipeline archive for $GPUS (metal-tt; minutes when its inputs changed)"
+  python3 "$DM/gfx/tools/pso_offline.py" --game "$GAME" --msl "$MSL_IOS/b-$V" --out "$PSO" --work "$W/build/ios/pso/work" --gpu "$GPUS" ${DM_PSO_IOS_MIN:+--os-min "$DM_PSO_IOS_MIN"} \
+    | while IFS= read -r ln; do t "$ln"; done
+  [ "${PIPESTATUS[0]}" = 0 ] || die "pipeline archive (dm/gfx/tools/pso_offline.py; DM_PSO_GPUS=none builds the app without it)"
+else [ "$GFXAPI" != nvn ] || t "no pipeline archive ($([ -n "${DM_PSO_GPUS+set}" ] && echo "DM_PSO_GPUS=${GPUS:-empty}" || echo "the profile does not set pso_mtl4 on; DM_PSO_GPUS=g18p builds one")$([ -f "$GD/shader_pairs.tsv" ] || echo ', no shader_pairs.tsv'))"; fi
 # The launcher's settings for this game (Launcher.swift): dm/games/settings.tsv filtered by the profile, main's rewriter table and the game's languages (dm/games/settings.py)
 L=$(GFXAPI="$GFXAPI" python3 "$DM/games/settings.py" "$GAME" "$PATCHED" "$VNACP" Gen/dm/launcher.json) || die "launcher settings (dm/games/settings.py)"; t "launcher: $L"
 # Diagnostic build: DM_ENV_FILE=file → dm/env.txt in the bundle (main.m sets one environment variable per line at boot)
@@ -112,7 +126,7 @@ fi
 xcodegen generate -q > /dev/null || die "xcodegen"
 # DM_METAL_CAPTURE=1: a development build that may write GPU frame captures (MetalCaptureEnabled; the host's DM_GPU_CAPTURE switch writes them to Documents)
 if [ "${DM_METAL_CAPTURE:-0}" = 1 ]; then /usr/libexec/PlistBuddy -c "Add :MetalCaptureEnabled bool true" Gen/Info.plist > /dev/null || die "MetalCaptureEnabled"; t "Metal frame capture: enabled (DM_METAL_CAPTURE=1)"; fi
-python3 tools/gen_resources.py "$IOS" "$ROMFS" "$MARKER" "$MSL_IOS/$MSLDIR" "$MSLDIR" "$AOC" "$XCODE_DD" "$DM/gfx/nvn/dmsh_chain.h" || die "generate Xcode resource paths"
+python3 tools/gen_resources.py "$IOS" "$ROMFS" "$MARKER" "$MSL_IOS/$MSLDIR" "$MSLDIR" "$AOC" "$XCODE_DD" "$DM/gfx/nvn/dmsh_chain.h" "$PSO" || die "generate Xcode resource paths"
 if [ "$PREPARE_XCODE" = YES ]; then
   t "Xcode project: $IOS/DmIOS.xcodeproj"
   t "Xcode derived data: $XCODE_DD"
@@ -137,9 +151,11 @@ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
 rm -rf "$APP/msl" "$O/Payload" "$O/out.ipa"   # (the last two: what the copy-and-zip packing left behind)
 P=Payload/DmIOS.app; MAPS=("$P=$APP" "$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR")
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
+if [ -n "$PSO" ]; then MAPS+=("$P/pso=$PSO"); fi
 MAPS+=("$P/romfs=$ROMFS")
 t "pack IPA (already-compressed game files stored, everything else deflated)"
-# The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines, which are off on iOS (DM_PSO_MTL4=1 turns them on): left out unless IOS_PULL=1
-SKIPS=(); [ "${IOS_PULL:-0}" = 1 ] || SKIPS=(--skip-suffix _bp.metallib)
+# The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines, which are off on iOS unless the profile sets pso_mtl4 on (or DM_PSO_MTL4=1), and the
+# pipeline archive's bases are made of them: left out only when there is no archive, the profile does not set pso_mtl4 on and IOS_PULL is not 1 (an Xcode build copies them always)
+SKIPS=(); [ -n "$PSO" ] || [ "$P4" = on ] || [ "${IOS_PULL:-0}" = 1 ] || SKIPS=(--skip-suffix _bp.metallib)
 python3 tools/pack_ipa.py "$OUT_IPA" --store "$(gp zip_store)" "${SKIPS[@]}" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs "${MAPS[@]}" || die "pack_ipa"
 t "done: $OUT_IPA ($(du -h "$OUT_IPA" | cut -f1))"
