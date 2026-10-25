@@ -249,6 +249,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Reader:** `uepak.py` `inline_shaders` tells such a pak from one with archives by its directory index (cooked packages and no `.ushaderbytecode`; an encrypted index is taken for one with archives), and `shader_split.py` `ue_legacy_jobs` reads it file by file, Zlib and LZ4 blocks decoded in Python (`Pak.read`), so no host runs. `ue_inline_shaders` finds each LZ4 block by its first literals, the record's `LSLG`, with the token and literal length bytes in front of it, and takes it when it decodes to exactly the raw size after the block.
 - **Found on:** [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md): 13,980 unique shaders (1,910 vertex, 11,346 pixel, 694 compute, 30 geometry) from the 3.3 GB pak in 13 s.
 
+### Unreal Engine 3 shader caches (Oodle-compressed packages)
+
+- **Symptom:** `the shader split found no shaders in main or the RomFS` for a game whose RomFS holds loose Unreal Engine 3 packages (`*.xxx`, `*.upk`, tag `C1 83 2A 9E`) and a `GlobalShaderCache-<platform>.bin`.
+- **How it is stored:** Rocksteady's Unreal Engine 3 keeps the engine's global shaders in `GlobalShaderCache-Switch.bin` (magic `BMSG`, stored whole, 1,847 shaders) and the material shaders in one package, `CombinedShaderCache-Switch.xxx` (22,874; 29 MB, 136 MB decoded). Each shader is a record `{u32, u32 code length, u32 control length, u32}` followed by its code area and its control section. The package's summary is stored as it is; after it come compressed chunks, each a header `{tag 0x9E2A83C1, u32 block size (128 KB), u32 compressed size, u32 raw size}`, one `{compressed, raw}` pair per block, then the blocks, every one Oodle (Mermaid, `8C 0A`). The summary is serialized differently from Epic's, so the first chunk is found by its header (the first consistent one in the first 64 KB).
+- **Reader:** `shader_split.py` `ue3_package` (chunks decoded: Zlib in Python, Oodle with the game's own `OodleLZ_Decompress` in the Mac host's tool mode, `DM_OODLE_SERVE`; [the NSP script](../development.md) sets `DM_OODLE_HOST` when `profile_guess.py` finds Unreal Engine 3 shader caches, `ue3`) and `ue3_records` (a control section counts when the code area of the length its +0x704 gives lies right before it and the record's two lengths say so). Every UE3 package of the RomFS is decoded and scanned (19 GB, 4,093 packages: 102 s with 4 workers); only the two caches hold shaders.
+- **Found on:** [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md): 24,721 records with distinct keys, 22,024 with the profile's `shader_key_skip` ([Control sections shared among shaders that differ only in their hash](#control-sections-shared-among-shaders-that-differ-only-in-their-hash); 2,629 vertex, 19,269 pixel, 124 compute, 2 geometry); vertex and pixel shaders combine per draw (bound shader states), so they are paired as single-stage programs.
+
 ## Control sections and code
 
 ### Code area and control section layout
@@ -269,6 +276,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** NVN lets the caller free a program's control section once `nvnProgramSetShaders` returns; Unity does, and the host used to hash it at the first draw, so keys computed later hashed freed memory.
 - **Fix:** the keys are now computed inside `SetShaders` (`hle_nvn.c` `prog_key`). Mario calls `SetShaders` for some programs with a code address that is not mapped yet, so a stage whose code is not in a registered memory pool at that moment is hashed at its first draw, as before.
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) and Unity games in general (the source names no other); [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (the unmapped code addresses).
+
+### Control sections shared among shaders that differ only in their hash
+
+- **Symptom:** shaders reported missing from the map although `DM_NVN_SHDUMP` shows both halves in the game's shader caches: the code area is one record's, the control section another's, and the two records' control sections differ only in the 24 bytes at +0x7d0.
+- **Cause:** the game keeps one control section for all shaders whose control sections are equal but for the hash GLSLC writes at +0x7d0 (+0x7c8 and +0x7e8 hold the section length around it), the first one it loaded, and hands that to `nvnProgramSetShaders` with each shader's own code area. Which record's control section a program gets depends on the load order, so its key is in no table.
+- **Fix:** the profile key `shader_key_skip <offset>+<length>` leaves those bytes out of every key (hashed as zeros): the host's `keys_hash` (`hle_nvn.c`) and `shader_split.py` (`key_ctl`, `same_shader`). Records whose control sections differ only there become one key. Game-specific because a general change would change every other profile's keys.
+- **Found on:** [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md): 31 of the 80 shaders its opening used were such pairs; with `shader_key_skip 0x7d0+0x18` the split gives 22,024 keys (24,721 before; 1,847 global shaders become 507), and a boot through the opening reports none missing.
 
 ### Compute code with and without a header
 
