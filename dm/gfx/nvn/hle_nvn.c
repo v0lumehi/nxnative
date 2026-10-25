@@ -449,6 +449,20 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
             (unsigned long long)o->serial, (void *)o->mem, (void *)o->pool, o->pool ? (void *)o->pool->mem : NULL, o->pool ? (unsigned long long)o->pool->size : 0ull, o->pool ? o->pool->flags : 0,
             (unsigned long long)o->off, o->d.target, o->d.format, o->d.flags, o->d.samples, o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.stride, (unsigned long long)o->L.size); }
     }
+    {   // DM_NVN_POOLPEAK=<MB> (diagnostic): for memory pools of at least that size, which 64 KB pages textures have ever been placed on; a line each time the set grows, with the largest
+        // range never used (how much room a game's render target pool has left, also when it allocates from both ends)
+        enum { PK_N = 8 }; static int on = -1; static uint64_t min_sz; static const void *pk_pool[PK_N]; static uint8_t *pk_map[PK_N]; static uint64_t pk_used[PK_N]; static int npk;
+        if (on < 0) { const char *e = getenv("DM_NVN_POOLPEAK"); on = e && atoi(e) > 0; min_sz = on ? (uint64_t)atoi(e) << 20 : 0; }
+        if (on && o->pool && o->pool->size >= min_sz && o->L.size) {
+            uint64_t np = (o->pool->size + 0xffff) >> 16; int i = 0; while (i < npk && pk_pool[i] != o->pool) i++;
+            if (i == npk && npk < PK_N) { pk_pool[npk] = o->pool; pk_map[npk] = calloc(np, 1); pk_used[npk++] = 0; }
+            if (i < npk && pk_map[i]) { uint64_t p0 = (uint64_t)o->off >> 16, p1 = ((uint64_t)o->off + o->L.size + 0xffff) >> 16, add = 0;
+                for (uint64_t q = p0; q < p1 && q < np; q++) if (!pk_map[i][q]) { pk_map[i][q] = 1; add++; }
+                if (add) { pk_used[i] += add; uint64_t gap = 0, run = 0; for (uint64_t q = 0; q < np; q++) { run = pk_map[i][q] ? 0 : run + 1; if (run > gap) gap = run; }
+                    LOG("[nvn] pool peak: pool %p (%.1f MB): %.1f MB of it used so far, largest range never used %.1f MB (ser=%llu %ux%u format %#x at %#llx)", (void *)o->pool, o->pool->size / 1048576.0,
+                        pk_used[i] / 16.0, gap / 16.0, (unsigned long long)o->serial, o->d.width, o->d.height, o->d.format, (unsigned long long)o->off); } }
+        }
+    }
     // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: they are created on the pool buffer (tex_linear), whatever the pool's CPU access, and read what was copied in
     if (s->pkg_data && o->mem) {
         memcpy(o->mem, s->pkg_data, o->L.size);
