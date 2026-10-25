@@ -183,6 +183,7 @@ Comparison and testing:
 | `DM_NVN_TBDR=1` | Turns on the pass optimizations of the replay layer (store / load elision, pass merging). They are off by default: they infer which textures a draw reads from its bound slots, which bindless textures defeat ([docs/agents/04-graphics.md](../../docs/agents/04-graphics.md) section 4) |
 | `DM_NVN_UNWRITTEN_DC=0` | With `DM_NVN_TBDR=1`, turns off the single item "attachments not written in this pass are not stored" |
 | `DM_NVN_FUSE_CHECK=1` | Same-frame check of pass merging; logs the comparison result every time |
+| `DM_NVN_SLICE_MERGE=0` | Passes into other layers of one array or cube texture level stay apart (by default they run as one layered pass: [reference](../../docs/reference/rendering.md#passes-into-other-layers-of-one-texture-level-run-as-one-layered-pass)) |
 | `DM_FPS=30` or `60` | Pins the target frame rate |
 | `DM_NVN_BARRIER=game`, `DM_NVN_CUT` | Pass ordering and segment commits: see [docs/agents/04-graphics.md](../../docs/agents/04-graphics.md) section 7 |
 | `DM_PRESENT_HZ=N` | The frequency of presentation pacing (default 60); 0 means no frame limit and is for performance profiling only |
