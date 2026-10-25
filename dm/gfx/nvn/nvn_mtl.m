@@ -7836,7 +7836,31 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
     { static int once; if (moved && !once++) MLOG("compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST): first case pass %llu, %d dispatches", g_stat_pass + 1, moved); }
 }
 void mtl_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = g_csh_moved; *depth = g_csh_depth; for (int i = 0; i < 7; i++) stops[i] = g_csh_stop[i]; }
+// DM_NVN_WPROBE read set: the 16 KB pages of pool memory the frame's draws let the GPU read directly (vertex and index buffers, indirect arguments, every bound uniform and storage
+// buffer; packaged textures are copies and are not counted), per frame, for the intersection with the pages the CPU writes (hle_nvn.c)
+enum { RS_N = 1 << 16 }; static uint64_t g_rs[2][RS_N]; static uint32_t g_rsg[2][RS_N]; static uint32_t g_rs_gen[2] = {1, 1}; static int g_rs_cur, g_rs_on = -1;
+static void rs_add(uint64_t a, uint64_t n) {
+    if (!a || !n) return; if (n > (64ull << 20)) n = 64ull << 20;
+    int c = g_rs_cur; for (uint64_t pg = a >> 14; pg <= (a + n - 1) >> 14; pg++) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
+        for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) { g_rsg[c][h] = g_rs_gen[c]; g_rs[c][h] = pg; break; } if (g_rs[c][h] == pg) break; } }
+}
+static int rs_has(int c, uint64_t pg) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 48) & (RS_N - 1);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (RS_N - 1)) { if (g_rsg[c][h] != g_rs_gen[c]) return 0; if (g_rs[c][h] == pg) return 1; } return 0; }
+// The pages written since the last call that the GPU reads in this frame or the one before; the read set rolls over to the next frame
+void mtl_rset_frame(const uintptr_t *w, uint64_t nw, uint64_t *hit, uint64_t *reads) {
+    uint64_t h = 0; for (uint64_t i = 0; i < nw; i++) { uint64_t pg = (uint64_t)w[i] >> 14; if (rs_has(0, pg) || rs_has(1, pg)) h++; }
+    uint64_t r = 0; for (int i = 0; i < RS_N; i++) r += g_rsg[g_rs_cur][i] == g_rs_gen[g_rs_cur];
+    *hit = h; *reads = r; g_rs_cur ^= 1; g_rs_gen[g_rs_cur]++;
+}
+static void rs_draw(const p_draw *dw, const p_draw_idx *di) {
+    if (g_rs_on < 0) g_rs_on = getenv("DM_NVN_WPROBE") != NULL;
+    if (!g_rs_on) return;
+    for (int s = 0; s < 16; s++) rs_add(S.vbuf[s].address, S.vbuf[s].size);
+    for (int st = 0; st < 6; st++) for (int r = 0; r < 16; r++) { rs_add(S.ubo[st][r].addr, S.ubo[st][r].size); rs_add(S.ssbo[st][r].addr, S.ssbo[st][r].size); }
+    if (di) { rs_add(di->ibuf, (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4)); rs_add(di->ind, 20); } else if (dw) rs_add(dw->ind, 16);
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
+    rs_draw(dw, di);
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
     if (!g_geo_program && S.prog) {
         NvProg *geometry_program = prog_get(S.prog);
