@@ -636,12 +636,21 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; stat
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 static _Atomic uint64_t g_sync_ns;
+__attribute__((weak)) void dm_guest_bt(char *o, size_t n) { if (n) o[0] = 0; }   // hle_thread.c; none in graphics unit tests
+__attribute__((weak)) uint64_t dm_main_off(const void *p) { (void)p; return ~0ull; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
-    if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    uint64_t fence = o->fence;
+    if (w(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    uint64_t t0 = now_ns(); int ok = w(fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    {   // DM_NVN_SYNC_WHO=1 (diagnostic): the guest call stack of blocking SyncWaits, each distinct caller once (up to 8), with the fence's age
+        static int who = -1; static uint64_t seen[8]; static int nseen; if (who < 0) who = getenv("DM_NVN_SYNC_WHO") != NULL;
+        uint64_t ra = (uint64_t)__builtin_return_address(0); int k = 0; while (k < nseen && seen[k] != ra) k++;
+        if (who && k == nseen && nseen < 8) { seen[nseen++] = ra; char bt[512]; dm_guest_bt(bt, sizeof bt);
+            LOG("[nvn] blocking SyncWait %.3f ms, fence %llu of %llu (%s), sync %p, return main+%#llx:%s", (now_ns() - t0) / 1e6, (unsigned long long)fence, (unsigned long long)mtl_last_fence(), o->fenced == 2 ? "acquire" : "FenceSync", (const void *)s, (unsigned long long)dm_main_off((void *)ra), bt); }
+    }
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
