@@ -35,6 +35,8 @@ ID=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=\(Apple Development.*\)/\1
 S="$ST/${DM_STAGE_NAME:-$(basename "$APP")}"
 rm -rf "$ST" && mkdir -p "$ST" && cp -cR "$APP" "$S" && mkdir -p "$S/msl" && cp -cR "$DM_RESOURCE_SHADERS" "$S/msl/$DM_RESOURCE_MSLDIR"
 [ -n "$DM_RESOURCE_AOC" ] && cp -cR "$DM_RESOURCE_AOC" "$S/aoc"
+# the pipeline archive made offline (build_ipa.sh DM_PSO_GPUS, gen_resources.py DM_RESOURCE_PSO; absent before it): <App>/pso, as stage_resources.sh copies it, only with its stamp
+if [ -n "${DM_RESOURCE_PSO:-}" ]; then [ -f "$DM_RESOURCE_PSO/prebuilt.tsv" ] || die "no prebuilt.tsv in the pipeline archive $DM_RESOURCE_PSO"; cp -cR "$DM_RESOURCE_PSO" "$S/pso"; fi
 for e in $DM_EXTRA_MSL; do cp -cR "${e#*=}" "$S/msl/${e%%=*}"; done
 cp -cR "$DM_RESOURCE_ROMFS" "$S/romfs"
 rm -rf "$S/_CodeSignature"
