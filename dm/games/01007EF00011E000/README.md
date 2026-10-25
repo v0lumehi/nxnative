@@ -131,7 +131,7 @@ Every kind of cold start also shows the game's own 130–220 ms frames every 9�
 | Second start (Metal cache and archive warm) | 0.08 s, no screen | 0 / 0 |
 | A player's list (5,783 lines with the manifest), warm | 0.23 s, no screen (2.7 s in the background) | 0 / 0 |
 
-- **The pipeline archive made offline** ([development.md](../../../docs/development.md#the-pipeline-archive-made-offline)): every one of the 15,767 pairs makes a base (none left to the device, none left out); `metal-tt` built the iPhone 17 Pro Max's archive (`applegpu_g18p`, iOS 27.0) in 252 s on an M2 Max: 653 MB, 219 MB zipped. On that iPhone (iOS 27.0.1) a test app found all 200 bases of a 200-pair archive, at 0.06–0.3 ms each. On the Mac the same build for the M2 Max (`applegpu_g14s`, 615 MB, 253 s) held all 15,767 bases: the prebuild tool with it opened it in 1.8 s from the external drive, found 16 of 16 probed bases in 57 ms and built nothing, where the device's own prebuild took 187 + 19 s on 7 workers. The process's footprint rose by about 615 MB with the archive open.
+- **The pipeline archive made offline** ([development.md](../../../docs/development.md#the-pipeline-archive-made-offline)): every one of the 15,767 pairs makes a base (none left to the device, none left out); `metal-tt` built the iPhone 17 Pro Max's archive (`applegpu_g18p`, iOS 27.0) in 252 s on an M2 Max: 653 MB, 219 MB zipped. On that iPhone (iOS 27.0.1) a test app found all 200 bases of a 200-pair archive, at 0.06–0.3 ms each. On the Mac the same build for the M2 Max (`applegpu_g14s`, 615 MB, 253 s) held all 15,767 bases: the prebuild tool with it opened it in 1.8 s from the external drive, found 16 of 16 probed bases in 57 ms and built nothing, where the device's own prebuild took 187 + 19 s on 7 workers. The process's footprint rose by about 615 MB with the archive open. Resolved on the iPhone 17 Pro Max (iOS 27.0.1): the app with the archive (622.8 MB) opened it in 555 ms, found 16 of 16 probed bases in 17 ms, and its prepare step took 0.53 s with no base compiled (1,722 bases from the archives), where the device's own prebuild took 7–8 minutes on a first start; footprint 1,424 MiB at frame 300 and 2,579–2,679 MiB in play to frame 2,100, with the device's own earlier prebuild (932.7 MB in 30 files of `pso_archive/`, from before the archive was shipped) still open beside it.
 
 On this Mac the background prewarm also ends before the save loads, so the step changes the first minute only where the prewarm is slower than the way into play: a slower device, fewer cores, a longer list, a player who skips through the title. Frames over 25 ms without pipeline work (20–71 per run) are the game's own and vary with the machine's other load.
 
@@ -164,7 +164,7 @@ General host changes first needed here; each applies to every game:
 
 ## Open
 
-- The full pipeline archive (15,767 bases, 653 MB) has not run on the iPhone yet: the first start without the 7–8 minute "Preparing pipelines", the archive's footprint against the app's memory limit, and the frame times after it.
+- The shipped pipeline archive without the device's own earlier prebuild files (the test iPhone's `pso_archive/` still held them, [Pipelines on a cold start](#pipelines-on-a-cold-start)): the footprint against the app's memory limit and the frame times after it.
 
 - The GPU particles' compute dispatches and the G-buffer decals still split passes; about 800 MB of attachments a frame outdoors.
 - `DM_RENDER_SCALE` does not change the Mac's GPU time; the sources give no iPhone measurement.
