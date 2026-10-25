@@ -1249,34 +1249,53 @@ static int ub_skip(const char *key) {   // Whether this phase should drop draws 
     return 0;
 }
 static long ab_len(void); static void ab_frame(uint64_t f);
-// DM_GPU_CAPTURE=<frame>[:<frames>] (diagnostic): a Metal GPU trace of those frames (default 1), or DM_GPU_CAPTURE=gpu:<ms>[:<after frame>] of one frame in the first scene whose GPU time passes <ms>, for Xcode's Metal debugger (per-draw cost, shader profiler). Written to the working
-// directory as dm_f<frame>.gputrace: the app's Documents on iOS, which needs a build with MetalCaptureEnabled (DM_METAL_CAPTURE=1 when the project is made); the run folder on the Mac,
-// which needs MTL_CAPTURE_ENABLED=1 in the environment. It captures the Metal 4 queue (Metal refuses to capture a Metal 4 device), so the old-queue helpers (present, some uploads) are not in it
+// DM_GPU_CAPTURE=<frame>[:<frames>] (diagnostic): a Metal GPU trace of those frames (default 1) for Xcode's Metal debugger (per-draw cost, shader profiler), or DM_GPU_CAPTURE=gpu:<ms>[:<after frame>]
+// of one frame in the first scene, after that frame, whose GPU time passes <ms> in 60 frames in a row (a single long frame in a light scene fired the first iPhone capture). Read again
+// when it changes, so the Mac's DM_CTL "env DM_GPU_CAPTURE=..." can set it while the game runs. iOS needs a build with MetalCaptureEnabled (DM_METAL_CAPTURE=1 when the project is
+// made), the Mac MTL_CAPTURE_ENABLED=1 in the environment. It captures the Metal 4 queue (Metal refuses to capture a Metal 4 device), so the old-queue helpers (present, some uploads)
+// are not in it. The trace is dm_<date>-<time>_f<frame>.gputrace in DM_GPU_CAPTURE_DIR, by default gpu_captures/ in the working directory (the app's Documents on iOS, the run folder
+// on the Mac). A trace takes 1.5-2 GB, so before each capture that folder alone is pruned: of its dm_*.gputrace entries the newest DM_GPU_CAPTURE_KEEP - 1 stay (default 2 with the new
+// one); nothing outside it is removed
 static long g_cap_f0 = -2, g_cap_n; static int g_cap_on;
+static NSString *gpu_capture_dir(void) {
+    const char *e = getenv("DM_GPU_CAPTURE_DIR"); NSString *dir;
+    if (e && *e) dir = @(e); else { char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "."); dir = [@(cwd) stringByAppendingPathComponent:@"gpu_captures"]; }
+    NSError *err = nil;
+    if (![NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) { MLOG("[RED] DM_GPU_CAPTURE: cannot make the folder %s: %s", dir.UTF8String, err.localizedDescription.UTF8String); return nil; }
+    return dir;
+}
+static void gpu_capture_prune(NSString *dir) {   // only dm_*.gputrace entries directly in the capture folder; the newest DM_GPU_CAPTURE_KEEP - 1 stay
+    const char *e = getenv("DM_GPU_CAPTURE_KEEP"); long keep = e ? atol(e) : 2; if (keep < 1) keep = 1;
+    NSFileManager *fm = NSFileManager.defaultManager; NSMutableArray<NSURL *> *traces = [NSMutableArray array];
+    for (NSURL *u in [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES] includingPropertiesForKeys:@[NSURLContentModificationDateKey] options:0 error:nil]) {
+        NSString *n = u.lastPathComponent; if ([n hasPrefix:@"dm_"] && [n hasSuffix:@".gputrace"]) [traces addObject:u]; }
+    [traces sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) { NSDate *da = nil, *db = nil;
+        [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil]; [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
+        return [db ?: NSDate.distantPast compare:da ?: NSDate.distantPast]; }];   // newest first
+    for (NSUInteger i = (NSUInteger)keep - 1; i < traces.count; i++) if ([fm removeItemAtURL:traces[i] error:nil]) MLOG("DM_GPU_CAPTURE: removed %s (older captures beyond DM_GPU_CAPTURE_KEEP=%ld)", traces[i].lastPathComponent.UTF8String, keep);
+}
 static void gpu_capture_frame(uint64_t f) {
-    static char last[32];   // read again when it changes (the Mac's DM_CTL "env DM_GPU_CAPTURE=<frame>")
+    static char last[32];   // read again when it changes
     { const char *e = getenv("DM_GPU_CAPTURE"); if (!g_cap_on && e && strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); g_cap_f0 = -2; } }
-    static double gpu_thr; static long after;
-    if (g_cap_f0 == -2) { const char *e = getenv("DM_GPU_CAPTURE"); gpu_thr = 0;
-        if (e && !strncmp(e, "gpu:", 4)) { gpu_thr = atof(e + 4); const char *c = strchr(e + 4, ':'); after = c ? atol(c + 1) : 0; g_cap_n = 1; g_cap_f0 = gpu_thr > 0 ? 0 : -1;
+    static double gpu_thr; static long after; static int over;
+    if (g_cap_f0 == -2) { const char *e = getenv("DM_GPU_CAPTURE"); gpu_thr = 0; over = 0;
+        if (e && !strncmp(e, "gpu:", 4)) { gpu_thr = atof(e + 4); const char *c = strchr(e + 4, ':'); after = c ? atol(c + 1) : 0; g_cap_n = 1; g_cap_f0 = gpu_thr > 0 ? LONG_MAX : -1;   // armed: the frame is not known yet
             if (gpu_thr > 0) MLOG("DM_GPU_CAPTURE: the first frame after frame %ld that follows 60 frames in a row with more than %.1f ms of GPU time is captured", after, gpu_thr); }
         else { g_cap_f0 = e ? atol(e) : -1; g_cap_n = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : 1; if (g_cap_n < 1) g_cap_n = 1; if (g_cap_f0 <= 0) g_cap_f0 = -1; } }
-    { static int swept; if (!swept++ && !getenv("DM_GPU_CAPTURE")) {   // GPU traces of earlier runs are 1.5–2 GB each: a run that does not capture removes those it finds in the working directory
-            NSArray *l = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@"." error:nil];
-            for (NSString *n in l) if ([n hasPrefix:@"dm_f"] && [n hasSuffix:@".gputrace"]) { [NSFileManager.defaultManager removeItemAtPath:n error:nil]; MLOG("DM_GPU_CAPTURE: removed %s from an earlier run", n.UTF8String); } } }
     if (g_cap_f0 < 0) return;
-    // DM_GPU_CAPTURE=gpu:<ms>[:<after frame>]: a heavy scene, whenever it comes: 60 frames in a row past <ms> (one long frame in a light scene fired it in the first iPhone run)
-    static int over; if (gpu_thr > 0 && !g_cap_on && f > 8 && (long)f >= after) { double g = mtl_gpu_ms(f - 8); over = g >= gpu_thr ? over + 1 : g >= 0 ? 0 : over; if (over >= 60) g_cap_f0 = (long)f; }
+    if (gpu_thr > 0 && !g_cap_on && f > 8 && (long)f >= after) { double g = mtl_gpu_ms(f - 8); over = g >= gpu_thr ? over + 1 : g >= 0 ? 0 : over; if (over >= 60) g_cap_f0 = (long)f; }
     MTLCaptureManager *m = [MTLCaptureManager sharedCaptureManager];
     if (!g_cap_on && f == (uint64_t)g_cap_f0) {
-        if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) { MLOG("[RED] DM_GPU_CAPTURE: this build cannot write GPU traces (iOS: MetalCaptureEnabled, a build made with DM_METAL_CAPTURE=1; Mac: MTL_CAPTURE_ENABLED=1)"); g_cap_f0 = -1; return; }
-        char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, ".");
-        NSString *path = [NSString stringWithFormat:@"%s/dm_f%llu.gputrace", cwd, (unsigned long long)f];
-        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        g_cap_f0 = -1;   // one capture per setting: a failure below does not retry every frame
+        if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) { MLOG("[RED] DM_GPU_CAPTURE: this build cannot write GPU traces (iOS: MetalCaptureEnabled, a build made with DM_METAL_CAPTURE=1; Mac: MTL_CAPTURE_ENABLED=1)"); return; }
+        NSString *dir = gpu_capture_dir(); if (!dir) return;
+        gpu_capture_prune(dir);
+        time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm); char ts[32]; strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tm);
+        NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"dm_%s_f%llu.gputrace", ts, (unsigned long long)f]];
         MTLCaptureDescriptor *d = [MTLCaptureDescriptor new]; d.captureObject = g_q4 ? (id)g_q4 : (id)g_dev; d.destination = MTLCaptureDestinationGPUTraceDocument; d.outputURL = [NSURL fileURLWithPath:path];
         NSError *err = nil;
-        if ([m startCaptureWithDescriptor:d error:&err]) { g_cap_on = 1; MLOG("DM_GPU_CAPTURE: capturing frames %llu to %llu into %s", (unsigned long long)f, (unsigned long long)(f + g_cap_n - 1), path.UTF8String); }
-        else { MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String); g_cap_f0 = -1; }
+        if ([m startCaptureWithDescriptor:d error:&err]) { g_cap_on = 1; g_cap_f0 = (long)f; MLOG("DM_GPU_CAPTURE: capturing frames %llu to %llu into %s", (unsigned long long)f, (unsigned long long)(f + g_cap_n - 1), path.UTF8String); }
+        else MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String);
     } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
 }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
