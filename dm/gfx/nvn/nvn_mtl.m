@@ -4041,6 +4041,9 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
+    // LOD bias (nvnSamplerBuilderSetLodBias), added to the level of detail of every sample as in NVN; Metal has it since 26 (S4.6, -16 to 15.999). It was left out: Breath of the Wild's
+    // G-buffer pass and shadow passes sample their material textures with a bias of -1, and the textures came out one mip level blurrier than on the Switch
+    if (@available(macOS 26.0, iOS 26.0, *)) d.lodBias = fminf(fmaxf(p.lod_bias, -16.0f), 15.98f);
     // Reduction (NVN 1 min / 2 max): the minimum or maximum of the texels a filtered sample covers, per channel (Metal 26). Pokémon Legends: Z-A builds its depth pyramid with a min sampler
     // (151607c7a92386cc reads the level above at an explicit LOD) and tests occlusion boxes against it; averaged, the pyramid is nearer than the scene at depth edges. Metal ignores the reduction
     // with a nearest or no mip filter, so such samplers filter mips linearly: at the integer LODs reductions are used with that gives the same level, and a sampler without mips keeps to the base
