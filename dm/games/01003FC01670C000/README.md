@@ -10,6 +10,7 @@ The Asian release (Japanese, Korean, Chinese) has its own title ID and `main` bu
 |---|---|---|
 | `alloc_big_align on` | [`game.tsv`](game.tsv) | the engine cuts ring heaps out of a memory pool at 64 KB GPU alignment, and the pool's storage comes from malloc: without 64 KB-aligned large allocations the third ring heap keeps base 0 and the prologue's first battle writes through a null pointer; see [Memory](#memory) |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | 256 MB in front + 256 MB alias region + 256 MB stack region + 3.25 GB heap region. No system resource: the game sets a heap |
+| `depth_mode zero` | `game.tsv` | the game sets the near = 0 depth mode, so the pipeline bases made before it runs (the NSP script's Mac prebuild, and a [pipeline archive made offline](../../../docs/development.md#the-pipeline-archive-made-offline) for the iPhone when one is built with `DM_PSO_GPUS`) take its vertex shaders' `main0_z` entries (the host itself follows the mode the game sets) |
 
 No `patches.py`, no `sdk_patches.py` cut for its `sdk` build (`2d369d99…`), no `pad_layout` (the iPhone pad starts in the 2D layout).
 
