@@ -77,7 +77,11 @@ if [ $steady = 1 ]; then
         get log.txt "$R/log.txt" && LC_ALL=C grep -aq "DM_CTL: mark end" "$R/log.txt" && break; sleep 5; done
 else say "[RED] no steady mark within ${DM_AUTO_STEADY_WAIT:-420} s"; fi
 # --- stop, pull, clean up
-if [ $KEEP = 0 ]; then P2=$(running_pid); [ -n "$P2" ] && dc device process terminate --pid "$P2"; sleep 2; fi
+if [ $KEEP = 0 ]; then   # terminate, wait for the exit, and kill what is left (one run's app still ran when the next run started)
+    P2=$(running_pid); [ -n "$P2" ] && dc device process terminate --pid "$P2"
+    for i in 1 2 3 4 5 6 7 8; do [ -z "$(running_pid)" ] && break; sleep 2; done
+    P2=$(running_pid); [ -n "$P2" ] && { dc device process signal --signal 9 --pid "$P2"; sleep 2; say "the app did not end on SIGTERM; killed"; }
+fi
 get log.txt "$R/log.txt"; get frames.tsv "$R/frames.tsv"
 for s in $(sed -n 's/^shot \([^ /]*\.png\)$/\1/p' "$R/route.ctl"); do get "$s" "$R/$s"; done
 cleanup_device
