@@ -7981,9 +7981,10 @@ static void dispatch(const p_dispatch *dp);
 // traffic). When a draw opens a pass, the ops after it are scanned up to the first op that would end the pass anyway; each dispatch met on the way runs right away, before the pass
 // opens, if moving it ahead of the draws before it in that stretch changes nothing they read or write: it writes no memory those draws read (vertex, index, indirect, uniform and
 // storage buffers; storage buffers count as written by the dispatch), samples no colour attachment of the pass, writes no image, and the draws write no memory (no storage buffer,
-// image or transform feedback). Replay then skips it, and the pass stays open across it. Not exact for one read: a dispatch that samples the pass's depth attachment sees it as the
-// pass began, without the depth those draws wrote (BotW's particle collision misses the depth of the effect meshes drawn before it in the same frame). Off by default (value 1 or ab)
-static int cshoist_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_CS_HOIST", 0); return m; }
+// image or transform feedback). Replay then skips it, and the pass stays open across it. A dispatch that samples the pass's depth attachment sees it as the pass began, so it moves
+// only while no draw before it in the pass has depth writes on (until then that depth is the same; Breath of the Wild's particle collision samples the G-buffer depth). On by default
+// (0 off, ab alternates): Breath of the Wild at 900p on an M2 Max, 28 → 8 compute encoders and 149 → 129 render passes a frame, frame p50 10.2 → 8.8 ms
+static int cshoist_mode(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_CS_HOIST", 1); if (!m) MLOG("DM_NVN_CS_HOIST=0: compute dispatches between the draws of a pass end it"); } return m; }
 typedef struct { uint64_t lo, hi; } csh_rng;
 enum { CSH_RN = 1024, CSH_MAX = 64 };
 static const uint8_t *g_csh_op[CSH_MAX]; static int g_csh_n; static uint64_t g_csh_depth, g_csh_stop[8];
@@ -8027,6 +8028,7 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
     if (!csh_draw_reads(pr0, dw0, di0, rd, &nrd)) { g_csh_stop[0]++; return; }
     fz_cursor cur = {.p = g_exec_next}; for (int k = 0; k < g_ret_n; k++) cur.ret[cur.ret_n++] = g_ret[k];
     static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S); typeof(R) Rsave = R; int pso_dirty = g_pso_dirty, dss_dirty = g_dss_dirty, moved = 0;
+    int dwrote = R.rt.depth && S.ds.dw;   // a draw of the stretch so far may write the pass's depth
     for (int guard = 0; guard < 4096; guard++) {
         const uint8_t *q; op_hdr hq; const void *aq;
         if (!fz_next(&cur, &q, &hq, &aq)) break;
@@ -8035,14 +8037,16 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
             p_draw tdw; p_draw_idx tdi; const p_draw *d = hq.op == OP_DRAW ? draw_rec(aq, hq.size, &tdw) : NULL; const p_draw_idx *x = hq.op == OP_DRAW_IDX ? draw_idx_rec(aq, hq.size, &tdi) : NULL;
             prog_resolve(); __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil;
             if (!csh_draw_reads(pr, d, x, rd, &nrd)) { g_csh_stop[1]++; break; }
+            if (R.rt.depth && S.ds.dw) dwrote = 1;
             continue; }
         if (hq.op == OP_DISPATCH) {
             const p_dispatch *dp = aq; __unsafe_unretained NvShader *cs = S.cprog && prog_get(S.cprog) ? prog_get(S.cprog)->sh[5] : nil;
             static csh_rng wr[CSH_RN]; int nwr = 0, depth = 0;
             if (!csh_cs(cs, dp, wr, &nwr, &depth)) { g_csh_stop[2]++; break; }
+            if (depth && dwrote) { g_csh_stop[7]++; break; }   // it would miss depth the draws before it wrote
             if (csh_hit(wr, nwr, rd, nrd)) { g_csh_stop[3]++; break; }   // the draws before it read what it writes
             if (g_csh_n >= CSH_MAX) { g_csh_stop[4]++; break; }
-            PD("H %llu dispatch %s moved ahead of the pass%s", g_stat_pass + 1, cs->key, depth ? " (samples the pass's depth as the pass begins)" : "");
+            PD("H %llu dispatch %s moved ahead of the pass%s", g_stat_pass + 1, cs->key, depth ? " (samples the pass's depth, which no draw before it wrote)" : "");
             dispatch(dp); g_csh_op[g_csh_n++] = q; g_csh_moved++; g_csh_depth += depth; moved++;
             continue; }
         if (state_op(hq.op, aq)) continue;
@@ -8052,7 +8056,7 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
     memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave; g_pso_dirty = pso_dirty || moved; g_dss_dirty = dss_dirty || moved; prog_resolve();
     { static int once; if (moved && !once++) MLOG("compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST): first case pass %llu, %d dispatches", g_stat_pass + 1, moved); }
 }
-void mtl_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = g_csh_moved; *depth = g_csh_depth; for (int i = 0; i < 7; i++) stops[i] = g_csh_stop[i]; }
+void mtl_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = g_csh_moved; *depth = g_csh_depth; for (int i = 0; i < 8; i++) stops[i] = g_csh_stop[i]; }
 // DM_NVN_WPROBE read set: the 16 KB pages of pool memory the frame's draws let the GPU read directly (vertex and index buffers, indirect arguments, every bound uniform and storage
 // buffer; packaged textures are copies and are not counted), per frame, for the intersection with the pages the CPU writes (hle_nvn.c)
 enum { RS_N = 1 << 16 }; static uint64_t g_rs[2][RS_N]; static uint32_t g_rsg[2][RS_N]; static uint32_t g_rs_gen[2] = {1, 1}; static int g_rs_cur, g_rs_on = -1;
