@@ -67,7 +67,10 @@ if [ $steady = 1 ]; then
         xcrun devicectl device info details --device "$D" >> "$L" 2>&1   # the device "connected" for xctrace
         INST=(--template 'Metal System Trace'); [ $COUNTERS = 1 ] && INST+=(--instrument 'Metal GPU Counters')
         say "recording ${SECS} s (${INST[*]})"
+        : > "$R/.rec_start"
         xcrun xctrace record "${INST[@]}" --device "$D" --all-processes --time-limit "${SECS}s" --no-prompt --output "$R/trace.trace" >> "$L" 2>&1 || say "[RED] xctrace exited $?"
+        # xctrace leaves its raw kernel trace in the temp folder (about 0.1 GB per second recorded); the internal disk also has to hold the device installer's stage
+        for k in "${TMPDIR:-/tmp}"/instruments*.ktrace; do [ -f "$k" ] && [ "$k" -nt "$R/.rec_start" ] && ! lsof "$k" >/dev/null 2>&1 && rm -f "$k"; done
     else sleep "$SECS"; fi
     t1=$(date +%s)
     while [ $(( $(date +%s) - t1 )) -lt "${DM_AUTO_END_WAIT:-120}" ]; do

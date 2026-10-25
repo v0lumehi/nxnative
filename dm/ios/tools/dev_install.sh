@@ -27,6 +27,9 @@ xcodebuild -quiet -project "$X/DmIOS.xcodeproj" -scheme "$SCHEME" -configuration
   || { tail -30 "$W/xcodebuild.log"; die "xcodebuild failed (log: $W/xcodebuild.log)"; }
 APP="$OUT/Build/Products/Release-iphoneos/DmIOS.app"; [ -d "$APP" ] || die "no app at $APP"
 . "$X/Gen/resources.env"
+# A capture-enabled build (build_ipa.sh DM_METAL_CAPTURE=1) runs every Metal call through the capture layer: in Breath of the Wild on an iPhone 17 Pro Max it took 41 % of the
+# render thread (-[CaptureMTLBuffer contents], GTMemWatch_registerBuffer) and wrapped every encoder of the encode thread, so its CPU timings are not the product's
+/usr/libexec/PlistBuddy -c 'Print :MetalCaptureEnabled' "$APP/Info.plist" >/dev/null 2>&1 && echo "note: MetalCaptureEnabled is set: Metal runs through its capture layer, CPU timings include it (DM_ALLOW_CAPTURE=1 to install anyway)" && [ "${DM_ALLOW_CAPTURE:-0}" != 1 ] && die "a capture-enabled build is not for measurements"
 codesign -d --entitlements - --xml "$APP" > "$W/app.xcent"
 ID=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=\(Apple Development.*\)/\1/p' | head -1); [ -n "$ID" ] || die "the app is not signed with a development identity"
 S="$ST/${DM_STAGE_NAME:-$(basename "$APP")}"
