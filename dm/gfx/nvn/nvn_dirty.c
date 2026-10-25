@@ -205,3 +205,8 @@ void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
 }
+// Diagnostic (DM_NVN_WPROBE, hle_nvn.c): write-protect every tracked range, so the faults until the next call count the pages the CPU writes in a frame
+void nvn_dirty_protect_all(void) {
+    int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i)) nvn_dirty_protect((const void *)r->base, r->end - r->base); }
+}
