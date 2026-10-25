@@ -1529,10 +1529,24 @@ static _Atomic uint64_t g_itv2_since;   // start of the game's current run of in
 // (fstep_tick, nvn_fstep.h) and presents follow the hold k it decides with it
 __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c; graphics unit tests have no loader
 __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine frame limits in game memory (Monster Hunter Rise); graphics unit tests have no host
+// Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
+// has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
+// then took 17-26 ms a frame and dropped a frame in most windows; a steady 30 instead also lets the device cool. DM_THERMAL_CAP=0 turns it off; the Mac reports no thermal state
+#define THERMAL_CALM_NS 30000000000ull
+static int thermal_capped(void) {
+    static int on = -1, capped; static uint64_t last, calm_since;
+    if (on < 0) { const char *e = getenv("DM_THERMAL_CAP"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return 0;
+    uint64_t now = now_ns(); if (now - last < 1000000000ull) return capped; last = now;   // the thermal state is read once a second
+    int th = dm_thermal_now();
+    if (th >= 2) { calm_since = 0; if (!capped) { capped = 1; LOG("[nvn] thermal state %d: the frame step holds 30 fps until the device is fair again for %llu s (DM_THERMAL_CAP=0 turns this off)", th, THERMAL_CALM_NS / 1000000000ull); } }
+    else if (capped) { if (!calm_since) calm_since = now; else if (now - calm_since >= THERMAL_CALM_NS) { capped = 0; LOG("[nvn] thermal state %d for %llu s: back to the frame rate cap", th, THERMAL_CALM_NS / 1000000000ull); } }
+    return capped;
+}
 static int fps_step_cap(void) {
     if (!dm_fps_state) return 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
-    return t <= 0 ? 0 : __atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) || t <= 30 ? 30 : 60;
+    return t <= 0 ? 0 : __atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) || t <= 30 || thermal_capped() ? 30 : 60;
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
 static nvn_fstep g_fs;   // present thread only
