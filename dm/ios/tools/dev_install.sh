@@ -43,7 +43,10 @@ codesign --verify --deep "$S"
 echo "$(date +%T) staged and signed: $S (free: internal $(free_gb /) GB, $W $(free_gb "$W") GB)"
 [ $INSTALL = 1 ] || exit 0
 # someone may be playing (a user's run is not under any lock file): never replace the app under a running game
-xcrun devicectl device info processes --device "$DEV" 2>/dev/null | grep -q '\.app/DmIOS' && die "the app is running on the device; not installing"
+# (this bundle's install path: other test apps on the device have a DmIOS executable too)
+APPURL=$(xcrun devicectl device info apps --device "$DEV" --bundle-id "$BID" --json-output "$W/.apps.json" >/dev/null 2>&1 && python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["apps"][0]["url"])' "$W/.apps.json" 2>/dev/null)
+if [ -n "$APPURL" ]; then xcrun devicectl device info processes --device "$DEV" --json-output "$W/.ps.json" >/dev/null 2>&1
+    python3 -c 'import json,sys; sys.exit(0 if any(p.get("executable","").startswith(sys.argv[2]) for p in json.load(open(sys.argv[1]))["result"]["runningProcesses"]) else 1)' "$W/.ps.json" "$APPURL" && die "the app is running on the device; not installing"; fi
 [ "$(free_gb /)" -ge "${DM_MIN_FREE_GB:-20}" ] || die "only $(free_gb /) GB free on the internal disk; the installer stages the whole app there (DM_MIN_FREE_GB=${DM_MIN_FREE_GB:-20})"
 xcrun devicectl device install app --device "$DEV" "$S" > "$W/install.log" 2>&1 || { tail -20 "$W/install.log"; die "install failed (log: $W/install.log)"; }
 echo "$(date +%T) installed on $DEV (free: internal $(free_gb /) GB)"
