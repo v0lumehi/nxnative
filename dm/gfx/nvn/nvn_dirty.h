@@ -16,3 +16,4 @@ void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // Cumulative
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // Cumulative: this module's mprotect call count, pages covered, time spent
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // Currently live slots, slot table high-water mark, total number of registrations
 void nvn_dirty_protect_all(void);                                  // diagnostic: protect every tracked range (DM_NVN_WPROBE)
+void nvn_dirty_fault_log(int on); uint64_t nvn_dirty_fault_take(uintptr_t *out, uint64_t from, uint64_t max);   // diagnostic: addresses of the game's write faults (DM_NVN_WPROBE)
