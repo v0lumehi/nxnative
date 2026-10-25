@@ -1050,3 +1050,14 @@ void hle_clear_system_event(void *ev) {   // Clear a bound service-layer SystemE
     }
     pthread_mutex_unlock(&G);
 }
+// The calling thread's guest frames (module+offset, up to 8, through the frame-pointer chain from here): for diagnostics in the graphics layer (hle_nvn.c DM_NVN_SYNC_WHO)
+void dm_guest_bt(char *o, size_t n) {
+    size_t q = 0; o[0] = 0; uint64_t *fp = (uint64_t *)__builtin_frame_address(0);
+    for (int k = 0, g = 0; k < 40 && g < 8 && fp && q < n - 40; k++) {
+        uint64_t a = fp[1]; fp = (uint64_t *)fp[0];
+        module_t *m = module_of((void *)a);
+        if (m) { q += (size_t)snprintf(o + q, n - q, " %s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base)); g++; }
+    }
+}
+// Offset of a code address in main (~0 when it is not main's): for diagnostics keyed to a call site of the game (hle_nvn.c DM_NVN_SYNC_LAG)
+uint64_t dm_main_off(const void *p) { module_t *m = module_of(p); return m && !strcmp(m->name, "main") ? (uint64_t)((const uint8_t *)p - (const uint8_t *)m->base) : ~0ull; }
