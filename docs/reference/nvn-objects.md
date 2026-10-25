@@ -162,6 +162,14 @@ Games read this count as a position in their own command memory and size their h
 - **Check:** GPU load from outside: `ioreg -r -d 1 -c IOAccelerator | grep 'Device Utilization'` at 100 % means a shader is looping forever. Find the shaders first used in the last frames (`DM_NVN_PASSDUMP`, compare the `K` keys) and look at their `.metal` for an empty `do {} while (true);` with no `return` (one such case: [Exact program start for the decoder](shaders.md#exact-program-start-for-the-decoder)).
 - **Found on:** no game named in the source (general).
 
+### The game's SyncWait wakes on the GPU's own signal of its fence
+
+- **Symptom:** the frame's blocking SyncWait on its newest fence wakes about 0.26–0.29 ms after the GPU end (M2 Max; the wait ledger, `DM_NVN_WAITS=1`), on the critical path of every frame.
+- **Cause:** the waiter slept until the commit feedback handler of the fence's submission had run, which comes that long after the GPU end.
+- **Fix:** the game's waits (newest fence, older fence, acquire sync) wait on `g_ev`, which the queue signals after each submission, and then make the CPU-side writes of every submission up to the fence that no handler has made yet (`post_early`: events, samples-passed and counter reports; a ring of `POST_RING` records, each run once by whichever comes first). A counter report of the fence's last segment takes the wake as that segment's end. `DM_NVN_FAST_WAKE=0` turns it off.
+- **Note:** the commit feedback handler's other blocks (diagnostics such as `DM_NVN_FUSE_CHECK`) still run when the handler does, after a fast-woken wait has returned.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): it reads 5 timestamp reports a frame right after the wait (its interval controller and dynamic resolution), which is why the waiter makes them itself. Wake after the GPU end 0.29 → 0.08 ms on an M2 Max, 0.147 ms on an iPhone 17 Pro Max.
+
 ### `nvnQueueFinish` waits for the GPU, not the display
 
 - **Symptom:** loading screens many times slower on the iPhone than on the Mac (Three Houses' first loading screen 78 s on the iPhone, 5 s on the Mac).
