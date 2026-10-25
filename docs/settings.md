@@ -4,7 +4,7 @@ The screen before the game starts shows the settings the game supports. Tap **Pl
 
 - [Tested defaults](#tested-defaults)
 - [Settings](#settings-1): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Game language](#game-language), [Frame-rate counter](#frame-rate-counter), [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength)
-- [Advanced](#advanced): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Advanced](#advanced): [Upscaling](#upscaling), [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [Settings in a file](#settings-in-a-file)
 
 ## Tested defaults
@@ -50,6 +50,25 @@ How strong the game's vibration is, from 0 to 300 %.
 ## Advanced
 
 These settings change how the app hands frames to the screen and how it prepares the GPU's work. The game's tested defaults are a good start; change them when a game stutters, runs hot, or you want less latency.
+
+### Upscaling
+
+A game that renders below the screen's resolution is scaled up to the screen. **Standard**, the default, scales smoothly; **MetalFX** uses Apple's MetalFX upscaler, which sharpens edges and text as it scales.
+
+```mermaid
+flowchart LR
+    G["Game's picture<br/>handheld 1280x720<br/>docked 1920x1080"] --> S{Upscaling}
+    S -->|Standard| B["Smooth scaling"]
+    S -->|MetalFX| M["MetalFX: sharper edges and text"]
+    B --> D["Screen<br/>2868x1320 on an iPhone 17 Pro Max"]
+    M --> D
+```
+
+Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its world at 900p and scales that to 1080p itself, before the app sees the picture. MetalFX works in either mode: handheld saves the most GPU time and heat, docked looks sharper than smooth scaling. Rendering at the screen's resolution stays the sharpest picture, where the GPU can afford it.
+
+- **When to change it:** turn it on if the picture looks soft, and especially in handheld mode, which keeps the iPhone cooler.
+- **Cost:** a little GPU time each frame (0.4 to 1.3 ms on an M2 Max; more on an iPhone, not measured yet). Nothing changes while the game's picture is as large as the screen.
+- **On the Mac:** the Mac app has no settings screen; the line `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` turns it on (off by default). It helps in a large window or on a 4K screen.
 
 ### Frame buffering
 
@@ -165,6 +184,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
 | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
+| Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
