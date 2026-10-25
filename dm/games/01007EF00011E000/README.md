@@ -142,6 +142,7 @@ On this Mac the background prewarm also ends before the save loads, so the step 
 
 General host changes first needed here; each applies to every game:
 
+- **Thermal cap** (`thermal_capped`, `DM_THERMAL_CAP`): [A thermally serious iPhone holds 30 fps](../../../docs/reference/frame-rate.md#a-thermally-serious-iphone-holds-30-fps).
 - **Pipeline keys omit disabled blend factors** (`pso_key_norm`): [Pipeline keys omit unused colour state](../../../docs/reference/shaders.md#pipeline-keys-omit-unused-colour-state).
 - **Resolved: GPU readback temporaries retained by a game thread's outer pool** (`mtl_read_texels`): [GPU readback without an autorelease pool](../../../docs/reference/memory.md#gpu-readback-without-an-autorelease-pool). Ported from MacNativeGames; checked here with a synthetic Metal readback lifetime test, without a new gameplay memory measurement.
 - **Compute dispatches ahead of their pass** (`cs_hoist_try`, `DM_NVN_CS_HOIST`): [Compute dispatches between the draws of a pass run ahead of it](../../../docs/reference/rendering.md#compute-dispatches-between-the-draws-of-a-pass-run-ahead-of-it).
