@@ -27,7 +27,7 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; } range_t;
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint8_t *pf; _Atomic uint32_t *rf; } range_t;   // pf / rf: frame pipelining (nvn_pipe_*)
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -86,11 +86,13 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
 enum { FLOG_N = 65536 }; static uintptr_t g_flog[FLOG_N]; static _Atomic uint64_t g_flog_n; static int g_flog_on;
 void nvn_dirty_fault_log(int on) { g_flog_on = on; }
 uint64_t nvn_dirty_fault_take(uintptr_t *out, uint64_t from, uint64_t max) { uint64_t n = atomic_load(&g_flog_n), k = 0; if (n - from > FLOG_N) from = n - FLOG_N; for (uint64_t i = from; i < n && k < max; i++) out[k++] = g_flog[i % FLOG_N]; return n; }
+static void pipe_fault(range_t *r, uintptr_t p, void *uc); static void pipe_epoch_bump(void);
+static int g_pipe_on;
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
     if (!is_write) return 0;
     if (g_flog_on) { uint64_t i = atomic_fetch_add(&g_flog_n, 1); g_flog[i % FLOG_N] = (uintptr_t)addr; }
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    if (g_pipe_on) for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) pipe_fault(r, (a - r->base) >> g_shift, uc); }   // before any range lets the write through
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
     return ours;
@@ -146,19 +148,21 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     range_t *r = rg(slot);
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
-    _Atomic uint8_t *state = r->state;
+    _Atomic uint8_t *state = r->state, *pf = r->pf;
     _Atomic uint64_t *gen = r->gen;
+    _Atomic uint32_t *rf = r->rf;
     if (r->cap < np) {
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen);
-        if (!state || !gen) die("dirty-page table allocation failed (%zu pages)", np);
-        // The old array is not freed: the signal handler may still have a very brief stale reader; leak = 9 bytes per page.
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen); pf = calloc(np, 1); rf = calloc(np, sizeof *rf);
+        if (!state || !gen || !pf || !rf) die("dirty-page table allocation failed (%zu pages)", np);
+        // The old arrays are not freed: the signal handler may still have a very brief stale reader; leak = 14 bytes per page.
         r->cap = np;
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)pf, 0, np); memset((void *)rf, 0, np * sizeof *rf);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
+    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->pf = pf; r->rf = rf;
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    pipe_epoch_bump();   // a pool over memory another one had: its pages are not classified
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
@@ -175,10 +179,13 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
+static void protect_pages(range_t *r, uintptr_t p, uintptr_t q);
 void nvn_dirty_protect(const void *addr, size_t len) {
     range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
     if (!r) return;
-    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    uintptr_t a = (uintptr_t)addr; protect_pages(r, (a - r->base) >> g_shift, (a + len - 1 - r->base) >> g_shift);
+}
+static void protect_pages(range_t *r, uintptr_t p, uintptr_t q) {
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
     // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing
     uintptr_t run = 0; int open = 0;
@@ -215,3 +222,109 @@ void nvn_dirty_protect_all(void) {
     int n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i)) nvn_dirty_protect((const void *)r->base, r->end - r->base); }
 }
+
+// ---------- Frame pipelining (DM_NVN_PIPELINE, nvn_mtl.m pipe_*) ----------
+// With frame pipelining the CPU prepares frame N+1 while the GPU still runs frame N, so a page of pool memory frame N reads directly (a vertex, index, uniform or storage buffer, a
+// copy's source) must not change under it. Each such page is either hot, written by the CPU from frame to frame, and then every binding over it reads a shadow made when the frame is
+// replayed (the caller copies), or cold: write-protected, so the first CPU write faults, and the fault waits until the GPU work that read the page directly has completed (rf, the
+// low 32 bits of its fence) before the write goes through and the page turns hot. A page is classified (PF_KNOWN) the first time a binding reads it; a host write (a counter report,
+// a file read) forgets the classification, so the next direct read protects it again. Hot pages are probed a few a frame: protected again (PF_PROBE) while their bindings still
+// read shadows; one not written for PIPE_PROBE_FRAMES presents goes back to cold. Untracked memory (no range) is always shadowed by the caller
+enum { PF_KNOWN = 1, PF_HOT = 2, PF_PROBE = 4, PF_LISTED = 8 };
+enum { PIPE_RING = 16384, PIPE_PROBE_FRAMES = 4, PIPE_WAIT_MAX_MS = 250 };
+static uint64_t (*g_pipe_done)(void);   // the newest completed fence (nvn_mtl.m)
+static int (*g_pipe_guest)(void *uc);   // the faulting instruction is guest code (a host write never waits: it may be the thread that completes the fence)
+static struct { range_t *_Atomic r; _Atomic uintptr_t p; } g_pipe_ring[PIPE_RING];   // pages turned hot by a fault, for the probe list (the handler cannot allocate)
+static _Atomic uint64_t g_pipe_ring_head, g_pipe_ring_tail;
+static _Atomic uint32_t g_pipe_epoch;   // bumped whenever a page turns hot or cold (the caller's caches of classified ranges)
+uint32_t nvn_pipe_epoch(void) { return atomic_load_explicit(&g_pipe_epoch, memory_order_acquire); }
+static _Atomic uint64_t g_ps_faults, g_ps_stalls, g_ps_stall_ns, g_ps_timeouts, g_ps_host, g_ps_hot, g_ps_probes, g_ps_demoted, g_ps_protected, g_ps_reprot;
+void nvn_pipe_init(uint64_t (*done)(void), int (*guest_pc)(void *uc)) { g_pipe_done = done; g_pipe_guest = guest_pc; g_pipe_on = 1; }
+static uint64_t mono_ns(void) { return mach_absolute_time() * g_tb.numer / g_tb.denom; }
+static void pipe_fault(range_t *r, uintptr_t p, void *uc) {
+    if (!r->pf || p >= r->cap) return;
+    uint8_t f = atomic_load(&r->pf[p]);
+    if (!(f & PF_KNOWN)) return;   // not a page a binding read
+    atomic_fetch_add(&g_ps_faults, 1);
+    if (g_pipe_guest && !g_pipe_guest(uc)) { atomic_fetch_and(&r->pf[p], (uint8_t)~(PF_KNOWN | PF_PROBE)); atomic_fetch_add(&g_ps_host, 1); atomic_fetch_add(&g_pipe_epoch, 1); return; }
+    uint32_t need = atomic_load(&r->rf[p]);
+    if (need && g_pipe_done && (int32_t)(need - (uint32_t)g_pipe_done()) > 0) {   // a submission still running reads this page directly: the write waits for it
+        uint64_t t0 = mono_ns(), lim = t0 + (uint64_t)PIPE_WAIT_MAX_MS * 1000000ull;
+        for (unsigned n = 0; (int32_t)(need - (uint32_t)g_pipe_done()) > 0; n++) {
+            if (n < 64) { sched_yield(); continue; }
+            struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
+            if (mono_ns() > lim) { atomic_fetch_add(&g_ps_timeouts, 1); break; }
+        }
+        atomic_fetch_add(&g_ps_stalls, 1); atomic_fetch_add(&g_ps_stall_ns, mono_ns() - t0);
+    }
+    uint8_t old = atomic_fetch_or(&r->pf[p], PF_HOT);
+    atomic_fetch_and(&r->pf[p], (uint8_t)~PF_PROBE);
+    if (!(old & PF_HOT)) { atomic_fetch_add(&g_ps_hot, 1); atomic_fetch_add(&g_pipe_epoch, 1); }
+    if (!(old & PF_LISTED)) {
+        uint64_t h = atomic_load(&g_pipe_ring_head);
+        if (h - atomic_load(&g_pipe_ring_tail) < PIPE_RING && atomic_compare_exchange_strong(&g_pipe_ring_head, &h, h + 1)) {
+            atomic_fetch_or(&r->pf[p], PF_LISTED); atomic_store(&g_pipe_ring[h % PIPE_RING].p, p + 1); atomic_store(&g_pipe_ring[h % PIPE_RING].r, r); }
+    }
+}
+static range_t *pipe_range(const void *span, uint64_t lo, uint64_t hi) {
+    range_t *r = (range_t *)span;
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || lo < r->base || hi > r->end) r = find_span((uintptr_t)lo, (size_t)(hi - lo));
+    return r && r->pf ? r : NULL;
+}
+const void *nvn_pipe_span(const void *span, uint64_t lo, uint64_t hi) { return hi > lo ? pipe_range(span, lo, hi) : NULL; }
+// 1 when a page of [lo, hi) is hot (the binding reads a shadow), 0 when none is, -1 when the memory is not tracked
+int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return 0;
+    range_t *r = pipe_range(span, lo, hi); if (!r) return -1;
+    for (uintptr_t i = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift; i <= q; i++) if (atomic_load_explicit(&r->pf[i], memory_order_relaxed) & PF_HOT) return 1;
+    return 0;
+}
+// [lo, hi) is read directly by the submission with this fence: every page of it protected (a hot one turns cold again), stamped with the fence
+void nvn_pipe_direct(const void *span, uint64_t lo, uint64_t hi, uint32_t fence) {
+    if (hi <= lo) return;
+    range_t *r = pipe_range(span, lo, hi); if (!r) return;
+    uintptr_t p = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift, run = 0; int open = 0;
+    for (uintptr_t i = p; i <= q + 1; i++) {
+        int need = 0;
+        if (i <= q) { uint8_t f = atomic_load_explicit(&r->pf[i], memory_order_relaxed); atomic_store_explicit(&r->rf[i], fence, memory_order_relaxed);
+            if ((f & (PF_KNOWN | PF_HOT)) != PF_KNOWN) { need = 1; if (f & PF_HOT) { atomic_fetch_add(&g_ps_reprot, 1); atomic_fetch_add(&g_pipe_epoch, 1); } atomic_fetch_and(&r->pf[i], (uint8_t)~(PF_HOT | PF_PROBE)); atomic_fetch_or(&r->pf[i], PF_KNOWN); } }
+        if (need && !open) { run = i; open = 1; }
+        if (!need && open) { protect_pages(r, run, i - 1); atomic_fetch_add(&g_ps_protected, i - run); open = 0; }
+    }
+    atomic_thread_fence(memory_order_release);
+}
+// At each present: pages turned hot join the probe list; a few are protected again, and those not written for PIPE_PROBE_FRAMES presents since turn cold
+typedef struct { range_t *r; uintptr_t p; uint64_t at; } pipe_ent;
+static pipe_ent *g_pl; static size_t g_npl, g_capl, g_plcur; static uint64_t g_pl_frame;
+static pthread_mutex_t g_pl_mu = PTHREAD_MUTEX_INITIALIZER;
+void nvn_pipe_frame(void) {
+    pthread_mutex_lock(&g_pl_mu);
+    g_pl_frame++;
+    for (uint64_t t = atomic_load(&g_pipe_ring_tail), h = atomic_load(&g_pipe_ring_head); t < h; t++) {
+        range_t *r = NULL; uintptr_t p1 = 0;
+        for (int k = 0; k < 1000 && !((r = atomic_load(&g_pipe_ring[t % PIPE_RING].r)) && (p1 = atomic_load(&g_pipe_ring[t % PIPE_RING].p))); k++) sched_yield();   // a writer between its claim and its store
+        atomic_store(&g_pipe_ring[t % PIPE_RING].r, NULL); atomic_store(&g_pipe_ring[t % PIPE_RING].p, 0); atomic_store(&g_pipe_ring_tail, t + 1);
+        if (!r || !p1) continue;
+        if (g_npl == g_capl) { g_capl = g_capl ? 2 * g_capl : 1024; g_pl = realloc(g_pl, g_capl * sizeof *g_pl); }
+        g_pl[g_npl++] = (pipe_ent){r, p1 - 1, 0};
+    }
+    size_t budget = g_npl / 16 + 8;
+    for (size_t k = 0, n = g_npl; k < n && g_npl; k++) {
+        if (g_plcur >= g_npl) g_plcur = 0;
+        pipe_ent *e = &g_pl[g_plcur];
+        uint8_t f = e->p < e->r->cap && atomic_load(&e->r->live) ? atomic_load(&e->r->pf[e->p]) : 0;
+        if (!(f & PF_HOT)) { if (e->p < e->r->cap) atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~PF_LISTED); g_pl[g_plcur] = g_pl[--g_npl]; continue; }   // turned cold by a direct read, or the pool went
+        if (f & PF_PROBE) {
+            if (g_pl_frame - e->at >= PIPE_PROBE_FRAMES) { atomic_fetch_and(&e->r->pf[e->p], (uint8_t)~(PF_HOT | PF_PROBE | PF_LISTED)); atomic_fetch_add(&g_ps_demoted, 1); atomic_fetch_add(&g_pipe_epoch, 1); g_pl[g_plcur] = g_pl[--g_npl]; continue; }
+        } else if (budget) {
+            budget--; atomic_fetch_or(&e->r->pf[e->p], PF_PROBE); protect_pages(e->r, e->p, e->p); e->at = g_pl_frame; atomic_fetch_add(&g_ps_probes, 1);
+        } else break;
+        g_plcur++;
+    }
+    pthread_mutex_unlock(&g_pl_mu);
+}
+void nvn_pipe_stats(uint64_t s[12]) {
+    s[0] = g_ps_faults; s[1] = g_ps_stalls; s[2] = g_ps_stall_ns; s[3] = g_ps_timeouts; s[4] = g_ps_host; s[5] = g_ps_hot; s[6] = g_ps_probes; s[7] = g_ps_demoted; s[8] = g_ps_protected; s[9] = g_ps_reprot;
+    pthread_mutex_lock(&g_pl_mu); s[10] = g_npl; pthread_mutex_unlock(&g_pl_mu); s[11] = 0;
+}
+static void pipe_epoch_bump(void) { atomic_fetch_add(&g_pipe_epoch, 1); }
