@@ -92,7 +92,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
 enum { FLOG_N = 65536 }; static uintptr_t g_flog[FLOG_N]; static _Atomic uint64_t g_flog_n; static int g_flog_on;
 void nvn_dirty_fault_log(int on) { g_flog_on = on; }
 uint64_t nvn_dirty_fault_take(uintptr_t *out, uint64_t from, uint64_t max) { uint64_t n = atomic_load(&g_flog_n), k = 0; if (n - from > FLOG_N) from = n - FLOG_N; for (uint64_t i = from; i < n && k < max; i++) out[k++] = g_flog[i % FLOG_N]; return n; }
-static void pipe_fault(range_t *r, uintptr_t p, void *uc); static void pipe_epoch_bump(void);
+static void pipe_fault(range_t *r, uintptr_t p, void *uc); static void pipe_epoch_bump(void); static void pipe_forget(range_t *r, uintptr_t p);
 static int g_pipe_on;
 static int on_fault(void *addr, int is_write, void *uc) {
     if (!is_write) return 0;
@@ -112,11 +112,11 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (took) { if (!open) { run = i; open = 1; } continue; }
         if (open) {
             mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE);
-            for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); }
+            for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); if (g_pipe_on) pipe_forget(r, k); }
             if (count) atomic_fetch_add(count, i - run);
             open = 0;
         }
-        if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
+        if (i <= q && st == PG_BUSY) { release_page(r, i, count); if (g_pipe_on) pipe_forget(r, i); }   // another thread is changing it: wait, then unprotect it if it ended up protected
     }
 }
 static void prep_write(void *addr, size_t len) {
@@ -249,7 +249,7 @@ static struct { range_t *_Atomic r; _Atomic uintptr_t p; } g_pipe_ring[PIPE_RING
 static _Atomic uint64_t g_pipe_ring_head, g_pipe_ring_tail;
 static _Atomic uint32_t g_pipe_epoch;   // bumped whenever a page turns hot or cold (the caller's caches of classified ranges)
 uint32_t nvn_pipe_epoch(void) { return atomic_load_explicit(&g_pipe_epoch, memory_order_acquire); }
-static _Atomic uint64_t g_ps_adopted, g_ps_sticky, g_ps_faults, g_ps_stalls, g_ps_stall_ns, g_ps_timeouts, g_ps_host, g_ps_hot, g_ps_probes, g_ps_demoted, g_ps_protected, g_ps_reprot;
+static _Atomic uint64_t g_ps_retry, g_ps_forgot, g_ps_adopted, g_ps_sticky, g_ps_faults, g_ps_stalls, g_ps_stall_ns, g_ps_timeouts, g_ps_host, g_ps_hot, g_ps_probes, g_ps_demoted, g_ps_protected, g_ps_reprot;
 void nvn_pipe_init(uint64_t (*done)(void), int (*guest_pc)(void *uc)) { g_pipe_done = done; g_pipe_guest = guest_pc; g_pipe_on = 1; }
 static uint64_t mono_ns(void) { return mach_absolute_time() * g_tb.numer / g_tb.denom; }
 static void pipe_list(range_t *r, uintptr_t p) {   // a page turned hot joins the probe list at the next present (lock-free: also from the fault handler)
@@ -304,10 +304,13 @@ void nvn_pipe_direct(const void *span, uint64_t lo, uint64_t hi, uint32_t fence)
     for (uintptr_t i = p; i <= q + 1; i++) {
         int need = 0;
         if (i <= q) { uint8_t f = atomic_load_explicit(&r->pf[i], memory_order_relaxed); atomic_store_explicit(&r->rf[i], fence, memory_order_relaxed);
-            if ((f & (PF_KNOWN | PF_HOT)) != PF_KNOWN) { need = 1; if (f & PF_HOT) { atomic_fetch_add(&g_ps_reprot, 1); atomic_fetch_add(&g_pipe_epoch, 1); } atomic_fetch_and(&r->pf[i], (uint8_t)~(PF_HOT | PF_PROBE)); atomic_fetch_or(&r->pf[i], PF_KNOWN); } }
+            // the state too: a fault's classification lands before its release, so a page can be "known" yet writable
+            if ((f & (PF_KNOWN | PF_HOT)) != PF_KNOWN || atomic_load(&r->state[i]) != PG_PROT) { need = 1; if (f & PF_HOT) { atomic_fetch_add(&g_ps_reprot, 1); atomic_fetch_add(&g_pipe_epoch, 1); } atomic_fetch_and(&r->pf[i], (uint8_t)~(PF_HOT | PF_PROBE)); atomic_fetch_or(&r->pf[i], PF_KNOWN); } }
         if (need && !open) { run = i; open = 1; }
         if (!need && open) { protect_pages(r, run, i - 1); atomic_fetch_add(&g_ps_protected, i - run); open = 0; }
     }
+    // A page another thread was changing (BUSY) was skipped by protect_pages: once it settles, protected after all (a release in flight would leave it writable)
+    for (uintptr_t i = p; i <= q; i++) for (int t = 0; t < 4 && atomic_load(&r->state[i]) != PG_PROT; t++) { if (!busy_wait(r, i)) break; protect_pages(r, i, i); atomic_fetch_add(&g_ps_retry, 1); }
     atomic_thread_fence(memory_order_release);
 }
 // At each present: pages turned hot join the probe list; a few are protected again, and those not written for PIPE_PROBE_FRAMES presents since turn cold
@@ -340,8 +343,28 @@ void nvn_pipe_frame(void) {
     }
     pthread_mutex_unlock(&g_pl_mu);
 }
-void nvn_pipe_stats(uint64_t s[13]) {
+void nvn_pipe_stats(uint64_t s[15]) {
     s[0] = g_ps_faults; s[1] = g_ps_stalls; s[2] = g_ps_stall_ns; s[3] = g_ps_timeouts; s[4] = g_ps_host; s[5] = g_ps_hot; s[6] = g_ps_probes; s[7] = g_ps_demoted; s[8] = g_ps_protected; s[9] = g_ps_reprot;
-    pthread_mutex_lock(&g_pl_mu); s[10] = g_npl; pthread_mutex_unlock(&g_pl_mu); s[11] = g_ps_adopted; s[12] = g_ps_sticky;
+    pthread_mutex_lock(&g_pl_mu); s[10] = g_npl; pthread_mutex_unlock(&g_pl_mu); s[11] = g_ps_adopted; s[12] = g_ps_sticky; s[13] = g_ps_forgot; s[14] = g_ps_retry;
 }
 static void pipe_epoch_bump(void) { atomic_fetch_add(&g_pipe_epoch, 1); }
+// A page unprotected by a host write (prep_write: a file read into it, or a neighbouring pool going away, which unprotects the 16 KB pages it shares): no longer known to be
+// protected, so the next direct read protects it again. Without this a cold page stayed classified while writable, and the CPU's next writes reached a frame in flight
+// unseen (Breath of the Wild's minimap flickered: 560-byte uniform blocks in a page shared with another pool)
+static void pipe_forget(range_t *r, uintptr_t p) {
+    if (!r->pf || p >= r->cap) return;
+    uint8_t o = atomic_fetch_and(&r->pf[p], (uint8_t)~(PF_KNOWN | PF_PROBE));
+    if (o & PF_KNOWN) { atomic_fetch_add(&g_ps_forgot, 1); atomic_fetch_add(&g_pipe_epoch, 1); }
+}
+// Diagnostic (DM_NVN_PIPE_CHECK): the pipelining flags of the page holding addr | its protection state << 8 (-1: untracked)
+int nvn_pipe_page_info(const void *addr) {
+    range_t *r = find_span((uintptr_t)addr, 1); if (!r || !r->pf) return -1;
+    uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift; return atomic_load(&r->pf[p]) | atomic_load(&r->state[p]) << 8;
+}
+// Diagnostic: every live range holding addr, with the page's flags, state and read fence
+void nvn_pipe_page_dump(const void *addr, char *out, size_t n) {
+    size_t o = 0; out[0] = 0; uintptr_t a = (uintptr_t)addr; int nr = atomic_load(&g_nr);
+    for (int i = 0; i < nr && o + 80 < n; i++) { range_t *r = rg(i); if (!live_at(i) || a < r->base || a >= r->end || !r->pf) continue;
+        uintptr_t p = (a - r->base) >> g_shift;
+        o += (size_t)snprintf(out + o, n - o, " [range %d %p %#lx-%#lx mem %#lx: flags %#x state %d rf %u]", i, (void *)r, (unsigned long)r->base, (unsigned long)r->end, (unsigned long)r->mem, atomic_load(&r->pf[p]), atomic_load(&r->state[p]), atomic_load(&r->rf[p])); }
+}

@@ -7,6 +7,7 @@
 //   5. probes: a hot page left unwritten for 4 presents turns cold; one written after its probe stays hot (and the write did not wait: its readers read shadows)
 //   6. a host write (not guest code) never waits and forgets the classification; the next direct read protects the page again
 //   7. a new pool over the same memory starts unclassified
+//   9. a host write that unprotects a page (a neighbouring pool going away) forgets its classification, so the next direct read protects it again
 //   8. a page no binding has read can be taken as hot at once (adopt) and cools when left alone; its first write does not wait
 //   (5 also: a page that turns hot again after cooling stays hot for good)
 #include "../nvn/nvn_dirty.h"
@@ -39,7 +40,7 @@ static int guest_fn(void *uc) { (void)uc; return atomic_load(&g_guest); }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static void *advance(void *arg) { usleep(100000); atomic_store(&g_done, (uint64_t)(uintptr_t)arg); return NULL; }
 static double timed_write(volatile uint8_t *p, uint8_t v) { double t0 = now_ms(); *p = v; return now_ms() - t0; }
-static uint64_t stat(int i) { uint64_t s[13]; nvn_pipe_stats(s); return s[i]; }
+static uint64_t stat(int i) { uint64_t s[15]; nvn_pipe_stats(s); return s[i]; }
 
 int main(void) {
     crash_install();
@@ -133,6 +134,22 @@ int main(void) {
     EXPECT("7. a new pool over the memory: page 1 not hot", 0, nvn_pipe_hot(span, a + pg, a + 2 * pg, 0));
     f0 = stat(0); mem[pg] = 2;
     EXPECT("7. and not protected", f0, stat(0));
+
+    // 9. two pools in one 16 KB page: A read directly (protected); B goes away, which unprotects the shared page (prep_write). The next direct read of A must protect it again
+    uint8_t *m2 = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint64_t a2 = (uint64_t)(uintptr_t)m2;
+    nvn_dirty_add_range(m2, pg / 2); nvn_dirty_add_range(m2 + pg / 2, pg / 2 + pg);
+    const void *sa = nvn_pipe_span(NULL, a2, a2 + 256);
+    atomic_store(&g_done, 400);
+    nvn_pipe_direct(sa, a2, a2 + 256, 400);
+    f0 = stat(0); m2[8] = 1;
+    EXPECT("9. A's page protected by its direct read (a write faults)", f0 + 1, stat(0));
+    nvn_pipe_direct(sa, a2, a2 + 256, 400);   // protected again
+    nvn_dirty_remove_range(m2 + pg / 2);
+    EXPECT("9. B's removal: the classification is forgotten", 1, stat(13) >= 1);
+    nvn_pipe_direct(sa, a2, a2 + 256, 401);
+    f0 = stat(0); m2[16] = 2;
+    EXPECT("9. the next direct read of A protected the page again", f0 + 1, stat(0));
 
     printf("%s\n", g_fail ? "t_pipe: FAILED" : "t_pipe: all passed");
     return g_fail != 0;

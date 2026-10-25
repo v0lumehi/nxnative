@@ -24,4 +24,6 @@ int nvn_pipe_hot(const void *span, uint64_t lo, uint64_t hi, int adopt);  // 1: 
 void nvn_pipe_direct(const void *span, uint64_t lo, uint64_t hi, uint32_t fence);   // [lo, hi) is read directly by the submission with this fence: protected and stamped
 uint32_t nvn_pipe_epoch(void);                                            // changes whenever a page turns hot or cold
 void nvn_pipe_frame(void);                                                 // at each present: probes hot pages, turns unwritten ones cold
-void nvn_pipe_stats(uint64_t s[13]);   // cumulative: faults on classified pages, of them stalls, stall ns, timeouts, host writes, pages turned hot by a write, probes, cooled, pages protected, hot pages protected again; hot list size; pages adopted hot unread; pages hot for good
+void nvn_pipe_stats(uint64_t s[15]);   // cumulative: faults on classified pages, of them stalls, stall ns, timeouts, host writes, pages turned hot by a write, probes, cooled, pages protected, hot pages protected again; hot list size; pages adopted hot unread; pages hot for good; classifications forgotten by host writes
+int nvn_pipe_page_info(const void *addr);   // diagnostic: the page's pipelining flags | protection state << 8, -1 untracked
+void nvn_pipe_page_dump(const void *addr, char *out, size_t n);   // diagnostic: every range holding addr with the page's flags, state, read fence
