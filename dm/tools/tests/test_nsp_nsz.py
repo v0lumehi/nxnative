@@ -39,7 +39,7 @@ class Nsz(unittest.TestCase):
         self.assertTrue(src.is_absolute())
         self.assertTrue(out.is_absolute())
         self.assertNotIn('--keys', cmd)   # nsz 4.6.1's argument parser rejects it
-        self.assertEqual(cmd[2], nsp.NSZ_MAIN)
+        if cmd[0] != '/tools/nsz': self.assertEqual(cmd[2], nsp.NSZ_MAIN)   # else the standalone executable on PATH
         self.assertEqual(Path(cwd), out)
         staged = Path(cwd) / 'keys.txt'
         self.assertTrue(staged.is_symlink())
@@ -96,8 +96,17 @@ class Nsz(unittest.TestCase):
 
     def test_missing_nsz(self):
         app, fam = nsp.scan_nsps(self.tmp)
-        with mock.patch.object(importlib.util, 'find_spec', lambda m, *a: None), self.assertRaisesRegex(nsp.BuildError, 'pip install nsz'):
-            nsp.decompress_nsz(self.tmp, app, fam, self.tmp / 'prod.keys', {})
+        with mock.patch.object(importlib.util, 'find_spec', lambda m, *a: None), mock.patch.object(shutil, 'which', lambda *a, **k: None), self.assertRaisesRegex(nsp.BuildError, 'pip install nsz'):
+            nsp.decompress_nsz(self.tmp, app, fam, self.tmp / 'prod.keys', {'PATH': '/nowhere'})
+
+    def test_nsz_executable_on_path(self):   # no nsz module: a standalone nsz executable on PATH converts instead
+        app, fam = nsp.scan_nsps(self.tmp); cmds = []
+        fake = lambda cmd, log, env=None, cwd=None, on_line=None: (cmds.append(cmd), self.fake_nsz(cmd, log, env, cwd))
+        with mock.patch.object(importlib.util, 'find_spec', lambda m, *a: None), mock.patch.object(shutil, 'which', lambda n, path=None: '/tools/nsz' if n == 'nsz' else None), \
+             mock.patch.object(nsp, 'run', fake):
+            fam = nsp.decompress_nsz(self.tmp, app, fam, self.keys, {'PATH': '/tools'})
+        self.assertEqual({c[0] for c in cmds}, {'/tools/nsz'})
+        self.assertEqual(fam['base'].read_bytes(), b'nsp of Game [v0].nsz')
 
 
 if __name__ == '__main__':

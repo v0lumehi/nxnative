@@ -18,7 +18,7 @@
 # Uses only three things: this repository, a folder holding one game's NSPs (the base game, with or without an update; DLC NSPs, when present, are packed too and unlock the add-on content already in the game), and prod.keys.
 #   The newest version in the folder is packed. A version the profile registers (with every version in its shader_versions in the folder) is built from the profile as it is; any other
 #   version (the base game alone, another update) from a profile derived from it in <id>_build/profile: the same settings, and the version's own shaders (derive_profile).
-# Every intermediate file is under <id>_build/ in the NSP folder: nsp/ (NSZ / XCZ files converted to NSP / XCI with nsz -D, kept for the next build; pip install nsz), extract/ (the extracted game files, kept for the next build unless KEEP_EXTRACTED / --no-keep-extracted), aoc/ (each DLC's RomFS by index), tools/ (nx_extract, and the Mac host for a run-time shader capture), patched_*/, shader/ (shader package and caches, kept so the next build is fast), logs/ (each step's full output), tmp/, ipa/. The finished IPA also goes to the NSP folder by default.
+# Every intermediate file is under <id>_build/ in the NSP folder: nsp/ (NSZ / XCZ files converted to NSP / XCI with nsz -D, kept for the next build; pip install nsz, or an nsz executable on PATH), extract/ (the extracted game files, kept for the next build unless KEEP_EXTRACTED / --no-keep-extracted), aoc/ (each DLC's RomFS by index), tools/ (nx_extract, and the Mac host for a run-time shader capture), patched_*/, shader/ (shader package and caches, kept so the next build is fast), logs/ (each step's full output), tmp/, ipa/. The finished IPA also goes to the NSP folder by default.
 # The DLC, the rewrite, the shader split and the iOS (or Vulkan) shaders are reused when all their inputs are as at their last successful run (the game files, the tools, the profile, Xcode and spirv-cross: fingerprint() keys beside their output);
 #   the iOS shaders' inputs are the shader package's content and the chain's own tools, so a split that runs again and writes the same package leaves them reused.
 #   The chain version header dm/gfx/nvn/dmsh_chain.h (one version for every game) is written again when a chain change was committed without it (chain_header: it follows from the source alone),
@@ -437,8 +437,9 @@ def decompress_nsz(nsp_dir, app, fam, keys, env):
     paths = [fam['base']] + [p for _, p in fam['updates']] + [p for _, _, p in fam['dlc']]
     todo = [p for p in paths if p.suffix in COMPRESSED]
     if not todo: return fam
-    if importlib.util.find_spec('nsz') is None:
-        raise BuildError(f'NSZ / XCZ files need the nsz tool in the current Python ({sys.executable}): pip install nsz')
+    if importlib.util.find_spec('nsz') is not None: nsz = [sys.executable, '-c', NSZ_MAIN]
+    elif shutil.which('nsz', path=env.get('PATH')): nsz = [shutil.which('nsz', path=env.get('PATH'))]   # a standalone nsz executable (the release binary) on PATH
+    else: raise BuildError(f'NSZ / XCZ files need the nsz tool in the current Python ({sys.executable}: pip install nsz) or an nsz executable on PATH')
     out = nsp_dir.absolute() / f'{app:016X}_build' / 'nsp'; logs, tmp = out.parent / 'logs', out / 'partial'
     PROG.plan(1); PROG.stage('decompress NSZ', done=0, total=len(todo))
     conv, made = {}, 0
@@ -452,7 +453,7 @@ def decompress_nsz(nsp_dir, app, fam, keys, env):
             try:
                 # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
                 (tmp / 'keys.txt').symlink_to(keys.resolve())
-                run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
+                run([*nsz, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
                 if not (tmp / dst.name).is_file(): raise BuildError(f'nsz made no {dst.name} (full output: {log})')
                 (tmp / dst.name).rename(dst)
             finally: rmtree(tmp)
