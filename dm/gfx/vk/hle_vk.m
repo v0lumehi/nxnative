@@ -619,7 +619,7 @@ VKB(vkCreateSampler, VkResult, VkDevice d, const VkSamplerCreateInfo *ci, const 
                          ci->borderColor >= VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK ? MTLSamplerBorderColorOpaqueBlack : MTLSamplerBorderColorTransparentBlack;
         sd.lodMinClamp = ci->minLod; sd.lodMaxClamp = ci->maxLod;
         sd.normalizedCoordinates = !ci->unnormalizedCoordinates;
-        if (ci->mipLodBias != 0) RED1("sampler LOD bias %.2f not implemented", ci->mipLodBias);
+        if (@available(macOS 26.0, iOS 26.0, *)) sd.lodBias = fminf(fmaxf(ci->mipLodBias, -16.0f), 15.98f);   // Metal 26 (S4.6); earlier systems had none
         VkSampler s = zalloc(sizeof *s); s->s = [g_dev newSamplerStateWithDescriptor:sd];
         if (!s->s) LOG("[vk] [RED] cannot create the sampler");
         *out = s;
