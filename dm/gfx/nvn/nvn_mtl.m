@@ -278,7 +278,8 @@ void bf_want_note(const char *key) {
 }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; } pool_ent;   // res: already in the residency set (on demand, see pool_res)
+static int g_pipe = -1;   // frame pipelining on (DM_NVN_PIPELINE; pipe_on)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; const void *span; int span_ok; } pool_ent;   // res: already in the residency set (on demand, see pool_res); span: its tracked range (frame pipelining), looked up once
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
@@ -431,7 +432,7 @@ static NSHashTable *g_dead_pools;
 // took the lock), and its uniform rings move to a new page every few draws (the table alone missed as often)
 enum { PC_BITS = 10, PC_RECENT = 8 };
 static _Atomic uint64_t g_pool_gen = 1;
-typedef struct { uintptr_t lo, hi, base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; } pc_ent;
+typedef struct { uintptr_t lo, hi, base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *span; } pc_ent;
 static __thread struct { uint64_t gen; unsigned next; pc_ent r[PC_RECENT], e[1u << PC_BITS]; } t_pc;   // an empty entry has hi 0
 static inline unsigned pc_slot(uint64_t addr) { return (unsigned)(((addr >> 12) * 0x9E3779B97F4A7C15ull) >> (64 - PC_BITS)); }
 static inline const pc_ent *pc_get(uint64_t addr, uint64_t len) {
@@ -444,7 +445,8 @@ static inline const pc_ent *pc_get(uint64_t addr, uint64_t len) {
 static void pc_put(int i, uint64_t addr) {   // caller holds g_mu, pool i is resident and holds addr
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_relaxed);
     if (t_pc.gen != gen) { memset(t_pc.r, 0, sizeof t_pc.r); memset(t_pc.e, 0, sizeof t_pc.e); t_pc.gen = gen; }
-    pc_ent c = {g_pools[i].lo, g_pools[i].hi, g_pools[i].base, g_pools[i].buf, g_pools[i].gpu};
+    if (!g_pools[i].span_ok && g_pipe > 0) { g_pools[i].span = nvn_dirty_span((const void *)g_pools[i].lo, g_pools[i].hi - g_pools[i].lo); g_pools[i].span_ok = 1; }   // frame pipelining: the pool's tracked range (pipe_span)
+    pc_ent c = {g_pools[i].lo, g_pools[i].hi, g_pools[i].base, g_pools[i].buf, g_pools[i].gpu, g_pools[i].span};
     t_pc.e[pc_slot(addr)] = c; t_pc.r[t_pc.next++ % PC_RECENT] = c;
 }
 static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / texture / sampler registration: one of the invalidation conditions for argument buffer reuse
@@ -480,7 +482,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);   // the address index and the per-thread caches are invalid (pool_find, pc_get)
-    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0};   // not in the residency set yet: put in the first time it is addressed (pool_res)
+    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0, NULL, 0};   // not in the residency set yet: put in the first time it is addressed (pool_res)
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
@@ -1200,7 +1202,6 @@ static int ubp_get(uint64_t lo, uint64_t hi, uint64_t *gpu, const uint8_t **cpu)
 // write-protected with this submission's fence, so a CPU write before the GPU is done waits for it (and turns the page hot). Ranges the GPU writes (copies, fills, storage writes, earlier
 // submissions still running) are not shadowed: their pages are protected instead. A shadow is kept for the rest of the submission while no write is queued in it (the same block is bound by
 // draw after draw)
-static int g_pipe = -1;
 static uint64_t pipe_done_fence(void) { return g_done; }
 __attribute__((weak)) int dm_fault_in_guest(void *uc) { (void)uc; return 1; }   // hle_thread.c: the faulting instruction is guest code (graphics unit tests: always)
 static inline int pipe_on(void) {
@@ -1214,7 +1215,9 @@ static const char *const ps_name[PS_N] = {"direct", "page mirror", "shadow made"
 enum { PSPAN_N = 1024, PSH_N = 1024 };
 static const void *g_pspan[PSPAN_N];   // tracked range by 64 KB of address (a hint nvn_pipe_span checks)
 static struct { uint64_t a, n, gpu, ready; uint32_t sub, npend, sbw; __unsafe_unretained id<MTLBuffer> buf; size_t off; } g_psh[PSH_N];   // this submission's shadows
-static const void *pipe_span(uint64_t a, uint64_t n) { unsigned k = (unsigned)((a >> 16) * 0x9E3779B97F4A7C15ull >> 54) & (PSPAN_N - 1); const void *s = nvn_pipe_span(g_pspan[k], a, a + n); g_pspan[k] = s; return s; }
+static const void *pipe_span(uint64_t a, uint64_t n) {   // the pool's range from the address → pool cache (looked up once per pool), else a hint by 64 KB of address
+    const pc_ent *c = pc_get(a, n); if (c && c->span) return nvn_pipe_span(c->span, a, a + n);
+    unsigned k = (unsigned)((a >> 16) * 0x9E3779B97F4A7C15ull >> 54) & (PSPAN_N - 1); const void *s = nvn_pipe_span(g_pspan[k], a, a + n); g_pspan[k] = s; return s; }
 // The shadow of [a, a + n) as memory holds it now: GPU address, and the arena buffer / offset for a copy source (buf may be NULL)
 static uint64_t pipe_shadow(uint64_t a, uint64_t n, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
     unsigned k = (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ n) >> 54) & (PSH_N - 1);
@@ -1250,43 +1253,76 @@ static int pipe_mirror(uint64_t a, uint64_t n, uint64_t *gpu, __unsafe_unretaine
     *gpu = e->gpu + (a - base); if (buf) { *buf = e->buf; *off = e->off + (size_t)(a - base); }
     g_ps[PS_MIRROR]++; return 1;
 }
-// Ranges found cold and stamped in this submission, while no page has turned hot or cold since (nvn_pipe_epoch): bound again without looking at their pages
+// Ranges found cold and stamped in this submission, while no page has turned hot or cold since (nvn_pipe_epoch): bound again without looking at their pages; and ranges that read a
+// mirror, while also no write has been queued in the submission since (gpu: the mirror's address)
 enum { PRC_N = 4096 };
-static struct { uint64_t a, n; uint32_t sub, epoch; } g_prc[PRC_N];
+static struct { uint64_t a, n, gpu; uint32_t sub, epoch, npend, sbw; } g_prc[PRC_N];
 static inline unsigned prc_slot(uint64_t a, uint64_t n) { return (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ (n * 0xC2B2AE3D27D4EB4Full)) >> 52) & (PRC_N - 1); }
+// DM_NVN_PIPE_CHECK=1 (diagnostic): every range a submission reads directly is hashed when it is bound and again when the submission has completed; a difference means the CPU
+// wrote memory the GPU was reading (a write the protection missed), logged with the range and its page's classification
+typedef struct { uint64_t a, n, h; const void *span; int info; } pck_ent;
+static pck_ent *g_pck; static int g_npck, g_capck; static uint64_t g_pck_bytes;
+static int pck_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PIPE_CHECK"); v = e && atoi(e) > 0; if (v) MLOG("DM_NVN_PIPE_CHECK: directly read ranges are compared at the submission's end (slow)"); } return v; }
+static uint64_t pck_hash(uint64_t a, uint64_t n) { const uint8_t *p = (const uint8_t *)(uintptr_t)a; uint64_t h = 0x9E3779B97F4A7C15ull; uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull + (h >> 29); }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull; return h; }
+static void pck_note(uint64_t a, uint64_t n) {
+    if (!pck_on() || g_pck_bytes + n > (64ull << 20) || pend_hits(a, n) || gw_live(a, a + n) || (g_nsbw && sbw_hits(a, a + n))) return;
+    if (g_npck == g_capck) { g_capck = g_capck ? 2 * g_capck : 4096; g_pck = realloc(g_pck, (size_t)g_capck * sizeof *g_pck); }
+    g_pck[g_npck++] = (pck_ent){a, n, pck_hash(a, n), pipe_span(a, n), nvn_pipe_page_info((const void *)(uintptr_t)a)}; g_pck_bytes += n;
+}
+static void pck_commit(uint64_t fence) {   // mtl_sub_commit: the list goes to the submission's completion
+    if (!pck_on() || !g_npck) return;
+    int k = 0; for (int i = 0; i < g_npck; i++) if (!pend_hits(g_pck[i].a, g_pck[i].n) && !g_sbw_over && !(g_nsbw && sbw_hits(g_pck[i].a, g_pck[i].a + g_pck[i].n))) g_pck[k++] = g_pck[i];   // not what this submission's own GPU writes change
+    g_npck = k; if (!k) return;
+    pck_ent *l = g_pck; int n = g_npck; g_pck = NULL; g_npck = g_capck = 0; g_pck_bytes = 0;
+    [g_commit_blocks addObject:^{
+        static _Atomic int nbad; static _Atomic uint64_t nchk, nfail;
+        for (int i = 0; i < n; i++) { atomic_fetch_add(&nchk, 1); if (pck_hash(l[i].a, l[i].n) == l[i].h) continue; atomic_fetch_add(&nfail, 1);
+            if (atomic_fetch_add(&nbad, 1) < 40) { char d[600]; nvn_pipe_page_dump((const void *)(uintptr_t)l[i].a, d, sizeof d);
+                MLOG("[RED] pipelining check: [%#llx +%llu] read directly by fence %llu changed before it completed; at bind: range %p flags %#x state %d; now:%s", (unsigned long long)l[i].a, (unsigned long long)l[i].n,
+                     (unsigned long long)fence, l[i].span, l[i].info & 0xff, l[i].info >> 8, d); } }
+        uint64_t c = atomic_load(&nchk); if (c / 200000 != (c - (uint64_t)n) / 200000) MLOG("pipelining check: %llu ranges checked, %llu changed", (unsigned long long)c, (unsigned long long)atomic_load(&nfail));
+        free(l); }];
+}
 // What a binding of [a, a + n) reads (gpu: memory's own address). shadow: the binding only reads (a write must reach memory: storage written by the shader, image atomics)
 static uint64_t pipe_read_buf(uint64_t a, uint64_t n, uint64_t gpu, int shadow, __unsafe_unretained id<MTLBuffer> *buf, size_t *off) {
     if (!pipe_on() || !a || !n || !t_in_sub) return gpu;   // outside a submission's replay (a texture resolved on another thread) there is no fence to stamp
+    { static int ns = -1; if (ns < 0) { const char *e = getenv("DM_NVN_PIPE_NOSHADOW"); ns = e && atoi(e) > 0; if (ns) MLOG("DM_NVN_PIPE_NOSHADOW: no shadows, every direct read write-protected (diagnostic)"); } if (ns) shadow = 0; }
     uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
-    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) { g_ps[PS_DIRECT]++; return gpu; }
+    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) {
+        if (!g_prc[k].gpu) { g_ps[PS_DIRECT]++; pck_note(a, n); return gpu; }
+        if (!buf && g_prc[k].npend == (uint32_t)g_npend && g_prc[k].sbw == g_sbw_gen) { g_ps[PS_MIRROR]++; return g_prc[k].gpu; } }
     const void *span = pipe_span(a, n);
     int hot = span ? nvn_pipe_hot(span, a, a + n, shadow && n <= 65536) : -1;   // a small read-only range over pages no binding has read yet: hot at once (probed later), so the first write does not wait
     uint32_t fence = (uint32_t)(g_fence + 1);
-    if (!hot) { nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_DIRECT]++; g_prc[k].a = a; g_prc[k].n = n; g_prc[k].sub = sub; g_prc[k].epoch = nvn_pipe_epoch(); return gpu; }
-    if (!shadow) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_NOSHADOW]++; return gpu; }
+    if (!hot) { nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_DIRECT]++; pck_note(a, n); g_prc[k].a = a; g_prc[k].n = n; g_prc[k].gpu = 0; g_prc[k].sub = sub; g_prc[k].epoch = nvn_pipe_epoch(); return gpu; }
+    if (!shadow) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_NOSHADOW]++; pck_note(a, n); return gpu; }
     if ((g_nsbw && sbw_hits(a, a + n)) || g_sbw_over || gw_live(a, a + n)) { if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_GPU_WRITTEN]++; return gpu; }   // the GPU writes it: memory itself
     if (pend_hits(a, n)) {   // copies, fills or inline updates queued in this submission over it: their bytes laid over memory (uniform-sized ranges), else memory itself
         uint64_t g; const uint8_t *c; if (!buf && n <= 65536 && ubp_get(a, a + n, &g, &c)) { g_ps[PS_UBP]++; return g; }
         if (span) nvn_pipe_direct(span, a, a + n, fence); g_ps[PS_GPU_WRITTEN]++; return gpu; }
     if (hot < 0) g_ps[PS_UNTRACKED]++;
-    else { uint64_t g; if (pipe_mirror(a, n, &g, buf, off)) return g; }
+    else { uint64_t g; if (pipe_mirror(a, n, &g, buf, off)) {
+        if (!buf) { g_prc[k].a = a; g_prc[k].n = n; g_prc[k].gpu = g; g_prc[k].sub = sub; g_prc[k].epoch = nvn_pipe_epoch(); g_prc[k].npend = (uint32_t)g_npend; g_prc[k].sbw = g_sbw_gen; }
+        return g; } }
     return pipe_shadow(a, n, buf, off);
 }
 // Whether a page of [a, a + n) is hot, through the same cache (a vertex stream bound over a large buffer: only a hot one is narrowed to the draw's vertices)
 static int pipe_cold(uint64_t a, uint64_t n) {
     uint32_t ep = nvn_pipe_epoch(), sub = (uint32_t)g_sub_serial; unsigned k = prc_slot(a, n);
-    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) return 1;
+    if (g_prc[k].a == a && g_prc[k].n == n && g_prc[k].sub == sub && g_prc[k].epoch == ep) return !g_prc[k].gpu;
     const void *span = pipe_span(a, n);
     return span && nvn_pipe_hot(span, a, a + n, 0) == 0;
 }
 static inline uint64_t pipe_read(uint64_t a, uint64_t n, uint64_t gpu, int shadow) { return pipe_read_buf(a, n, gpu, shadow, NULL, NULL); }
 static void pipe_stats_line(void) {
-    static uint64_t prev[PS_N], prev_b, prev_m, pd[13]; uint64_t d[13]; nvn_pipe_stats(d);
+    static uint64_t prev[PS_N], prev_b, prev_m, pd[15]; uint64_t d[15]; nvn_pipe_stats(d);
     char line[1200]; int o = snprintf(line, sizeof line, "frame pipelining, per frame over 300:");
     for (int i = 0; i < PS_N; i++) { o += snprintf(line + o, sizeof line - o, " %s %.1f;", ps_name[i], (g_ps[i] - prev[i]) / 300.0); prev[i] = g_ps[i]; }
-    o += snprintf(line + o, sizeof line - o, " copied %.2f MB (mirror blocks %.1f); faults on read pages %.2f (stalled %.2f, %.3f ms; timeouts %llu; host writes %.2f), pages turned hot by a write %.2f, unread taken hot %.2f, probed %.2f, cooled %.2f, hot for good %llu, protected %.1f, hot ones protected again %.2f; hot list %llu",
+    o += snprintf(line + o, sizeof line - o, " copied %.2f MB (mirror blocks %.1f); faults on read pages %.2f (stalled %.2f, %.3f ms; timeouts %llu; host writes %.2f), pages turned hot by a write %.2f, unread taken hot %.2f, probed %.2f, cooled %.2f, hot for good %llu, protected %.1f, hot ones protected again %.2f, forgotten by host writes %.2f, protected after a race %.2f; hot list %llu",
                   (g_ps_bytes - prev_b) / 300.0 / 1048576.0, (g_pmr_blocks - prev_m) / 300.0, (d[0] - pd[0]) / 300.0, (d[1] - pd[1]) / 300.0, (d[2] - pd[2]) / 300.0 / 1e6, (unsigned long long)d[3], (d[4] - pd[4]) / 300.0,
-                  (d[5] - pd[5]) / 300.0, (d[11] - pd[11]) / 300.0, (d[6] - pd[6]) / 300.0, (d[7] - pd[7]) / 300.0, (unsigned long long)d[12], (d[8] - pd[8]) / 300.0, (d[9] - pd[9]) / 300.0, (unsigned long long)d[10]);
+                  (d[5] - pd[5]) / 300.0, (d[11] - pd[11]) / 300.0, (d[6] - pd[6]) / 300.0, (d[7] - pd[7]) / 300.0, (unsigned long long)d[12], (d[8] - pd[8]) / 300.0, (d[9] - pd[9]) / 300.0, (d[13] - pd[13]) / 300.0, (d[14] - pd[14]) / 300.0, (unsigned long long)d[10]);
     prev_b = g_ps_bytes; prev_m = g_pmr_blocks; memcpy(pd, d, sizeof pd);
     MLOG("%s", line);
 }
@@ -1532,6 +1568,7 @@ uint64_t mtl_sub_commit(void) {
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL; post_rec *pr = &g_postr[fence % POST_RING];
     if (ws_on()) for (int i = 0; i < n; i++) { int k = g_post[i].kind == 2 ? (g_post[i].type == 0 || g_post[i].type == 0x10 ? 3 : 4) : g_post[i].kind == 3 ? 2 : 1; atomic_fetch_add(&g_ws_post[k], 1); }   // 1 event, 2 samples passed, 3 timestamp, 4 other counter
     if (n) memcpy(ops, g_post, n * sizeof *ops);
+    pck_commit(fence);
     NSArray<dispatch_block_t> *commit_blocks = [g_commit_blocks copy];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; for (dispatch_block_t block in commit_blocks) block(); }];
@@ -4570,7 +4607,7 @@ static void vconv_fill(int f, uint64_t src, uint32_t stride, uint64_t nv, float 
 // DM_NVN_VCONV_CHECK=1 scans the indices again at every reuse and reports differences. DM_NVN_VCONV_RANGE=0 / 1 overrides the profile
 enum { VC_RGN = 1 << 16 };   // bits of the region filter
 typedef struct { uint64_t ibuf; int32_t count, itype; } ir_key;
-typedef struct { uint32_t mn, mx; uint64_t stamp, seen, lo, n; const void *span; int gpuw; } ir_ent;   // gpuw: a GPU write was queued on the indices: never trusted again
+typedef struct { uint32_t mn, mx; uint64_t stamp, seen, lo, n; const void *span; int gpuw; uint32_t wgen; } ir_ent;   // gpuw: a GPU write was queued on the indices: never trusted again; wgen: g_vc_wcount when made (vc_gpu_write)
 static nvn_hmap g_ir = {.klen = sizeof(ir_key)};
 static uint64_t g_vc_rgn[VC_RGN / 64], g_vc_stat, g_vc_conv, g_vc_whole, g_vc_checks, g_vc_bad;   // g_vc_rgn: 1 MB regions holding a kept index range (hashed); g_vc_conv / g_vc_whole: vertices converted / in the bound ranges
 static int vc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VCONV_RANGE"); v = e && *e ? atoi(e) != 0 : DM_GAME_VCONV_RANGE; MLOG("vertex conversion of the draw's vertices only: %s", v ? "on" : "off"); } return v; }
@@ -4578,9 +4615,22 @@ static int vc_check(void) { static int v = -1; if (v < 0) { const char *e = gete
 static inline uint32_t vc_rgn(uint64_t r) { return (uint32_t)((r * 0x9E3779B97F4A7C15ull) >> 48) & (VC_RGN - 1); }
 static void vc_rgn_mark(uint64_t lo, uint64_t n) { for (uint64_t r = lo >> 20; r <= (lo + n - 1) >> 20; r++) { uint32_t b = vc_rgn(r); g_vc_rgn[b >> 6] |= 1ull << (b & 63); } }
 static int vc_rgn_hit(uint64_t lo, uint64_t n) { for (uint64_t r = lo >> 20; r <= (lo + n - 1) >> 20; r++) { uint32_t b = vc_rgn(r); if (g_vc_rgn[b >> 6] >> (b & 63) & 1) return 1; } return 0; }
+// GPU writes by 64 KB region (hashed): the count of writes queued so far when one last covered the region. A kept range made before a write over one of its regions is not trusted
+// again. This used to scan every kept range at each write over a marked 1 MB region: with frame pipelining narrowing vertex streams through these ranges, Breath of the Wild's
+// inline uniform updates (beside its index buffers) spent about 7 % of the submit thread there
+enum { VC_WR = 1 << 16 };
+static uint32_t g_vc_wgen[VC_WR], g_vc_wcount, g_vc_wall;   // wall: a write over too many regions to mark
+static inline uint32_t vc_wr(uint64_t r) { return (uint32_t)((r * 0x9E3779B97F4A7C15ull) >> 48) & (VC_WR - 1); }
 static void vc_gpu_write(uint64_t dst, uint64_t n) {   // pend_add: a GPU write queued on [dst, dst + n)
     if (!n || !g_ir.n || !vc_rgn_hit(dst, n)) return;
-    for (uint32_t i = 0; i < g_ir.cap; i++) { ir_ent *e = g_ir.vals[i]; if (e && dst < e->lo + e->n && dst + n > e->lo) e->gpuw = 1; }
+    uint32_t g = ++g_vc_wcount;
+    if (((dst + n - 1) >> 16) - (dst >> 16) > 1024) { g_vc_wall = g; return; }
+    for (uint64_t r = dst >> 16; r <= (dst + n - 1) >> 16; r++) g_vc_wgen[vc_wr(r)] = g;
+}
+static int vc_written(ir_ent *e) {   // a GPU write was queued over the kept range's regions since it was made
+    if (e->gpuw) return 1;
+    int w = g_vc_wall > e->wgen; for (uint64_t r = e->lo >> 16; !w && r <= (e->lo + e->n - 1) >> 16; r++) w = g_vc_wgen[vc_wr(r)] > e->wgen;
+    return e->gpuw = w;
 }
 static void ix_minmax(const void *p, int isz, int32_t count, uint32_t *mn, uint32_t *mx) {
     uint32_t a = UINT32_MAX, b = 0;
@@ -4595,7 +4645,7 @@ static int ix_range(const p_draw_idx *di, uint32_t *mn, uint32_t *mx) {
     if (di->ind || di->mdi_cnt || di->count <= 0 || !di->ibuf || pend_hits(di->ibuf, n)) return 0;
     const void *p = (const void *)(uintptr_t)di->ibuf;
     ir_key k = {di->ibuf, di->count, di->itype}; ir_ent *e = nvn_hm_get(&g_ir, &k); uint64_t now = nvn_dirty_now();
-    if (e && e->gpuw) return 0;
+    if (e && vc_written(e)) return 0;
     if (e && (now == e->seen || !nvn_dirty_since_span(e->span, p, (size_t)n, e->stamp))) {
         e->seen = now; *mn = e->mn; *mx = e->mx;
         if (vc_check()) { uint32_t a, b; ix_minmax(p, isz, di->count, &a, &b); g_vc_checks++;
@@ -4605,7 +4655,7 @@ static int ix_range(const p_draw_idx *di, uint32_t *mn, uint32_t *mx) {
     const void *span = nvn_dirty_span(p, (size_t)n);
     if (!span) return 0;   // not in a tracked memory pool
     if (!e) { if (g_ir.n >= 1 << 16) { nvn_hm_clear(&g_ir, free); memset(g_vc_rgn, 0, sizeof g_vc_rgn); } e = calloc(1, sizeof *e); nvn_hm_put(&g_ir, &k, e); }
-    nvn_dirty_protect(p, (size_t)n); e->stamp = e->seen = nvn_dirty_now(); e->span = span; e->lo = di->ibuf; e->n = n; vc_rgn_mark(e->lo, e->n);   // protect, take the stamp, then read (as pkg_upload)
+    nvn_dirty_protect(p, (size_t)n); e->stamp = e->seen = nvn_dirty_now(); e->span = span; e->lo = di->ibuf; e->n = n; e->wgen = g_vc_wcount; vc_rgn_mark(e->lo, e->n);   // protect, take the stamp, then read (as pkg_upload)
     ix_minmax(p, isz, di->count, &e->mn, &e->mx); *mn = e->mn; *mx = e->mx;
     return 1;
 }

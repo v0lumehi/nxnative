@@ -641,6 +641,13 @@ __attribute__((weak)) uint64_t dm_main_off(const void *p) { (void)p; return ~0ul
 // writes from frame to frame that the frame in flight reads directly are shadowed when it is replayed (nvn_mtl.m pipe_*), so the next frame's writes do not reach it
 static uint64_t g_pres_fence[8], g_npres;   // the queue's last fence at each present (any window)
 int nvn_pipe_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PIPELINE"); v = e && atoi(e) > 0; if (v) LOG("[nvn] frame pipelining (DM_NVN_PIPELINE): waits on the last presented frame's work wait for the frame before it"); } return v; }
+// DM_NVN_PIPE_TRACE=<first present>: logs, for 12 presents from there, each acquire, submit, present and SyncWait with its thread and fences (diagnostic)
+static void pipe_trace(const char *what, uint64_t a, uint64_t b) {
+    static long from = -2; if (from == -2) { const char *e = getenv("DM_NVN_PIPE_TRACE"); from = e ? atol(e) : -1; }
+    if (from < 0 || g_npres < (uint64_t)from || g_npres >= (uint64_t)from + 12) return;
+    char nm[64] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    LOG("[pipe-trace] present %llu %-10s %llu %llu (last fence %llu, done?) thread '%s'", (unsigned long long)g_npres, what, (unsigned long long)a, (unsigned long long)b, (unsigned long long)mtl_last_fence(), nm);
+}
 static uint64_t g_pipe_lag, g_pipe_full;   // waits moved one frame back / waits on the frame in progress (logged with the timing lines)
 static uint64_t pipe_fence(uint64_t fence) {
     if (!nvn_pipe_on() || g_npres < 2) return fence;
@@ -654,6 +661,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     uint64_t fence = pipe_fence(o->fence);
+    pipe_trace(o->fenced == 2 ? "wait-acq" : "wait-sync", o->fence, fence);
     if (w(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     uint64_t t0 = now_ns(); int ok = w(fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
     {   // DM_NVN_SYNC_WHO=1 (diagnostic): the guest call stack of blocking SyncWaits, each distinct caller once (up to 8), with the fence's age
@@ -1173,6 +1181,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     mtl_exec_rest(NULL, 0);
     mtl_sub_commit();
     pthread_mutex_unlock(&g_sub_mu);
+    pipe_trace("submit", mtl_last_fence(), (uint64_t)n);
     uint64_t dw = now_ns() - t0;
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
@@ -1310,7 +1319,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // (frames in flight, DM_NVN_ACQ_DEPTH). Depth 1 is the newest fence: a game that waits for it drains the GPU every frame
     if (s) { static int depth = -1; if (depth < 0) { const char *e = getenv("DM_NVN_ACQ_DEPTH"); depth = e ? atoi(e) : 1; if (depth < 1) depth = 1; if (depth > 4) depth = 4; LOG("[nvn] acquire syncs: %d frame%s in flight (DM_NVN_ACQ_DEPTH)", depth, depth > 1 ? "s" : ""); }
         uint64_t k = o->presents >= (uint64_t)(depth - 1) ? o->presents - (uint64_t)(depth - 1) : 0;
-        ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = depth == 1 ? mtl_last_fence() : k ? o->pfence[k % 4] : 0; }
+        ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = depth == 1 ? mtl_last_fence() : k ? o->pfence[k % 4] : 0; pipe_trace("acquire", ((sync_t *)s)->fence, (uint64_t)*idx); }
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1718,6 +1727,7 @@ static void vstep_off(void) { if (dm_fps_var_cap) memset(dm_fps_state + 0x50, 0,
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++; o->pfence[o->presents % 4] = mtl_last_fence();
     g_npres++; g_pres_fence[g_npres % 8] = mtl_last_fence();
+    pipe_trace("present", mtl_last_fence(), 0);
     mtl_pipe_present();
     if (nvn_pipe_on() && g_npres % 300 == 0) { LOG("[nvn] frame pipelining up to present %llu: waits moved one frame back %.2f a frame, waits on the frame in progress %.2f", (unsigned long long)g_npres, g_pipe_lag / 300.0, g_pipe_full / 300.0); g_pipe_lag = g_pipe_full = 0; }
     dm_fps_lock_tick();
