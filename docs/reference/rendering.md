@@ -284,6 +284,15 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (13.0.5, `DM_WINDOW=1`).
 - **Check:** Breath of the Wild windowed with the change: its title, 60 fps, no GPU error.
 
+### The present upscales through MetalFX
+
+- **Symptom:** a game that renders below the screen's resolution looks soft: Breath of the Wild's handheld frame (1280x720) on an iPhone 17 Pro Max (2868x1320 landscape, a 2347x1320 picture between black bars, 1.83×), its docked 1920x1080 output (900p the game scales to 1080p itself) at 1.22×, or either in a large Mac window or on a 4K screen.
+- **Cause:** the drawable has the layer's native pixel size (`front_ios.m`, `front_mac.m`), and the present pass (`present_encode_m4`) scaled the presented texture into it bilinearly.
+- **Fix:** `DM_PRESENT_UPSCALE=metalfx` (the iOS launcher's **Upscaling**; off by default on every platform, no profile key): where the picture's rectangle on the canvas (`present_viewport`) is larger than the content (`fx_wanted`), the present copies the content to the origin of a texture of its size (MetalFX reads from the origin, so a crop with an offset works too), MetalFX's spatial scaler (`MTL4FXSpatialScaler`, perceptual colour processing: the input is the raw gamma-encoded bytes the present samples) scales it into a texture of the rectangle's size in the present's Metal 4 command buffer, and the present pass draws that 1:1 (`fx_encode`). Letterbox, the lower-left origin and the drawable format stay the present pass's. The copy waits for the queue's earlier work and ends with a producer barrier that the scaler's encoders wait behind. A new size or format makes a new scaler after the presents on the GPU finish, at most once every 30 presents (a window being resized shows bilinear frames meanwhile); a size MetalFX refuses stays bilinear. `DM_NVN_SHOT_OUT` screenshots draw the picture the same way (`present_offscreen_m4`); `DM_NVN_SHOT` and `DM_CTL` "shot" still save the game's own frame. Tests: `t_present_crop` (sizes, a MetalFX present with letterbox and sRGB bytes).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
+- **Cost (M2 Max, the present command buffer's GPU time):** 1280x720 → 2560x1440 0.74–1.32 ms against 0.07–0.11 ms bilinear in the game at 60 fps (the GPU's clock low), 0.40–1.17 ms against 0.04–0.07 ms back to back offline for 1280x720 → 2868x1320; docked 1920x1080 → 2560x1440 1.35 ms against 0.11 ms. Not measured on an iPhone.
+- **Limit:** the scaler takes the presented frame. Breath of the Wild draws its 900p scene into a 1080p target with one draw and then its HUD onto that target, so MetalFX upscales a frame that is already filtered once; feeding it the 900p target would mean replacing a draw of the game's own, and nothing general says which draw is a plain upscale.
+
 ## Blend, depth and stencil
 
 ### No writes to colour outputs the shader does not write
