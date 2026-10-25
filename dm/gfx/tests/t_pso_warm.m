@@ -111,7 +111,8 @@ static void scenario(NSString *dir, int merged) {
     EXPECT("seed manifest written", 1, [seed writeToFile:a atomically:YES encoding:NSUTF8StringEncoding error:nil]);
     EXPECT("user manifest written", 1, [user writeToFile:b atomically:YES encoding:NSUTF8StringEncoding error:nil]);
     uint64_t before = g_pb_spec + g_pb_legacy; g_warm_t0 = bp_now(); atomic_store(&g_warm_running, 1);
-    warm_worker(@[a, b]);
+    long lines = 0; for (WarmTask *t in warm_parse(@[a, b], &lines)) warm_task(t);
+    warm_finish();
     EXPECT("only three effective pipelines compiled across both manifests", 3, g_pb_spec + g_pb_legacy - before);
     EXPECT("only three render pipelines enqueued", 3, g_warm_rps);
     warm_claim();
