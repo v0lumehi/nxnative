@@ -701,7 +701,7 @@ static void ser_gate(void) {
 static int g_pass_swrite;   // the open draw pass has shader writes (swrite_note)
 static void img_fit_upgrade(void); static int g_imfit_npend;   // textures an image slot needs a format view of (img_fit), upgraded before the next draw pass opens
 static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the game issued nvnCommandBufferBarrier since the last draw pass began
-static uint64_t g_bar_skip, g_bar_full;            // draw passes begun without / with the consumer barrier (DM_NVN_BARRIER=game)
+static uint64_t g_bar_skip, g_bar_full, g_bar_frag;            // draw passes begun without / with the consumer barrier (DM_NVN_BARRIER=game)
 static void gp_end(id e);
 static inline void m4_end(id e) {
     gp_end(e);
@@ -712,8 +712,8 @@ static inline void m4_end(id e) {
 // later work, so the next pass's vertex work can overlap this pass's fragments (with the full barriers every pass waited for the previous one to finish completely: about 350 passes a frame in Breath of
 // the Wild). The next draw pass adds the full consumer barrier when the game called nvnCommandBufferBarrier since the last one (NVN asks for one before results of rendering are read as textures, shader data or
 // indirect arguments), or when anything other than a draw pass ran in between (compute, copies and uploads keep their full barriers). Only vertex-stage reads of the previous pass's results without a barrier change order
-static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strcmp(e, "game"); if (v) MLOG("DM_NVN_BARRIER=game: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments)"); } return v; }
-void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = g_bar_skip; *full = g_bar_full; }
+static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strcmp(e, "game") ? 1 : e && !strcmp(e, "nvn") ? 2 : 0; if (v) MLOG("DM_NVN_BARRIER=%s: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments%s)", v == 2 ? "nvn" : "game", v == 2 ? "; a game barrier without ORDER_PRIMITIVES / ORDER_INDIRECT_DATA orders only the fragment stage, as NVN defines it" : ""); } return v; }
+void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = g_bar_skip + g_bar_frag; *full = g_bar_full; }   // skip counts the fragment-only barriers of DM_NVN_BARRIER=nvn too
 uint64_t mtl_cut_count(void);
 // DM_NVN_GPUPROF=first frame[-last frame] (diagnostic): GPU time of every encoder of the main command buffers in those frames. A relaxed timestamp is written into a counter heap when an
 // encoder begins (before its first draw or dispatch) and when it ends (after its fragment stage); nothing is serialized beyond the barriers the replay already sets, so the frame runs
@@ -764,6 +764,10 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d];
     if (g_last_end_relaxed && !g_game_barrier) g_bar_skip++;
+    // DM_NVN_BARRIER=nvn: a game barrier with ORDER_FRAGMENTS (and cache invalidates) but neither ORDER_PRIMITIVES nor ORDER_INDIRECT_DATA orders fragment work after earlier fragment, compute and copy
+    // work, as NVN defines it; this pass's vertex stage may still overlap the previous pass's fragments (Breath of the Wild issues about 180 such barriers a frame, bits 0x12)
+    else if (g_last_end_relaxed && barrier_game() == 2 && !(g_game_barrier & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_INDIRECT_DATA_BIT))) {
+        [e barrierAfterQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit beforeStages:MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice]; g_bar_frag++; }
     else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; g_bar_full++; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
@@ -5965,6 +5969,8 @@ static int draw_samples_rt(NvProg *pr) {   // Sampled attachments keep the origi
 }
 // The whole render pass's need for depth / stencil (bits: 1 depth 2 stencil; 3 = both needed or cannot be proven). Starting from the draw that opens the render pass, scan in real replay order to the end of the render pass:
 // the attached clears and this draw's state are counted first; later draws accumulate by their depth-stencil state; anything unprovable such as a mid-pass clear or nesting too deep is treated as both needed
+// DM_NVN_DS_LOOKAHEAD=1 (experiment): the depth-stencil lookahead alone, outside TBDR mode. It simulates only the depth-stencil state of the draws ahead, so bindless textures do not affect it
+static int ds_la_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DS_LOOKAHEAD"); v = e && !strcmp(e, "1"); if (v) MLOG("DM_NVN_DS_LOOKAHEAD=1: a pass whose draws neither test nor write depth / stencil leaves those planes unattached"); } return v; }
 static int pass_ds_need(void) {
     int need = (R.clear_d || S.ds.dt || S.ds.dw ? 1 : 0) | (R.clear_s || S.ds.st ? 2 : 0);
     if (!R.rt.depth || need == 3 || !g_exec_next || g_ret_n > 16) {
@@ -7543,7 +7549,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     // The deferral decision comes after hoist_try: hoisted pure-clear render passes are skipped in the lookahead, and only then can P's same-target continuation segment be recognized
     if (!g_enc && tbdr_on() && !g_geo_program && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) return; }
     if (!g_enc && tbdr_on() && !g_fz_checking && !g_geo_program) fuse_try();   // Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
-    int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
+    int need = g_enc || !(tbdr_on() || ds_la_on()) ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
     int skip_d = mode != 0;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
@@ -8472,7 +8478,7 @@ void mtl_exec(const uint8_t *p) {
                 int split = g_enc && g_pass_swrite && (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT));
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
-                if (bits) g_game_barrier = 1; break; }
+                if (bits) g_game_barrier |= bits; break; }
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
             default: break;
         }
