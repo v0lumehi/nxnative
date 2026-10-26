@@ -28,6 +28,7 @@
 #include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <stdatomic.h>
+#include <os/lock.h>
 
 // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions
 enum { UE5, UE4_27, UE5_6, UE3 };
@@ -69,7 +70,29 @@ static void *alloc(size_t n, uint32_t a) {
     if (p) used((int64_t)malloc_size(p));
     return p;
 }
-static void release(void *p) { if (p) { used(-(int64_t)malloc_size(p)); malloc_zone_free(g_zone, p); } }
+// Freed blocks wait in a short FIFO before they go back to the zone (DM_UE_QUARANTINE=<ms>, 0 = off; on by default for Unreal Engine 3's layout). A macOS zone writes its
+// free-list pointer into a block's first word at once; Unreal's binned allocator leaves a large block's contents in place in its cache of freed pages, so a stale pointer the
+// engine reads a moment after the free still finds the object. Batman: Arkham Knight's rendering thread calls a virtual function of such an object (main+0x2031740, the object
+// at +0x38 of its caller's): with the zone's encoded pointer in place of the vtable it crashed about once in 30 boots. The quarantine keeps up to 64 MB of the most recent frees
+// for the given time (250 ms by default), and the memory accounting counts them as freed
+#define QUAR_N 8192
+#define QUAR_BYTES (64ull << 20)
+static struct { void *p; uint64_t t; size_t n; } g_q[QUAR_N];
+static unsigned g_qh, g_qt; static size_t g_qbytes; static uint64_t g_quar_ns; static os_unfair_lock g_ql = OS_UNFAIR_LOCK_INIT;
+static void release(void *p) {
+    if (!p) return;
+    size_t n = malloc_size(p); used(-(int64_t)n);
+    if (!g_quar_ns) { malloc_zone_free(g_zone, p); return; }
+    void *out[32]; int k = 0; uint64_t now = now_ns();
+    os_unfair_lock_lock(&g_ql);
+    while (g_qt != g_qh && k < 32 && (g_qt - g_qh >= QUAR_N || g_qbytes + n > QUAR_BYTES || now - g_q[g_qh % QUAR_N].t > g_quar_ns)) {
+        g_qbytes -= g_q[g_qh % QUAR_N].n; out[k++] = g_q[g_qh % QUAR_N].p; g_qh++;
+    }
+    if (g_qt - g_qh < QUAR_N) { g_q[g_qt % QUAR_N].p = p; g_q[g_qt % QUAR_N].t = now; g_q[g_qt % QUAR_N].n = n; g_qt++; g_qbytes += n; p = NULL; }
+    os_unfair_lock_unlock(&g_ql);
+    for (int i = 0; i < k; i++) malloc_zone_free(g_zone, out[i]);
+    if (p) malloc_zone_free(g_zone, p);
+}
 static void *realloc_aligned(void *p, size_t n, uint32_t a) {
     if (!p) return alloc(n, a);
     if (!n) { release(p); return NULL; }
@@ -139,6 +162,8 @@ void dm_ue_malloc_install(void) {
             g_vt[k_lay[L].quantize] = dw ? (void *)m3_QuantizeSize : (void *)m_QuantizeSize; g_vt[k_lay[L].get_size] = dw ? (void *)m3_GetAllocationSize : (void *)m_GetAllocationSize;
             for (int s = 0; s < 6 && k_lay[L].nothing[s]; s++) g_vt[k_lay[L].nothing[s]] = (void *)m_Nothing;
             g_zone = malloc_create_zone(0, 0); malloc_set_zone_name(g_zone, "guest Unreal heap"); g_what = k_ue[k].what;
+            { const char *e = getenv("DM_UE_QUARANTINE"); int ms = e ? atoi(e) : L == UE3 ? 250 : 0; g_quar_ns = ms > 0 ? (uint64_t)ms * 1000000 : 0;
+              if (ms > 0) LOG("%s: freed Unreal heap blocks wait %d ms (up to 64 MB) before they go back to the zone (DM_UE_QUARANTINE)", k_ue[k].what, ms); }
             if (!k_ue[k].obj) { gate_obs_set(OBS_UE_MALLOC, obj_made); continue; }
             *(void **)(b + k_ue[k].obj) = g_vt;
             LOG("%s: Unreal's allocator (FMallocBinned3 at main+%#llx) runs on a host malloc zone", k_ue[k].what, (unsigned long long)k_ue[k].obj);
