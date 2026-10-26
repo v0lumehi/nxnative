@@ -614,14 +614,14 @@ void svc_thread_dump(void) {
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
         // A thread in an SVC: the guest code that called it, from its stack. Engines built without frame pointers (Batman: Arkham Knight's Unreal Engine 3) leave the frame-pointer backtrace
-        // at the SVC wrapper, so the words above the gate's register frame (the guest stack at the SVC, regs + 800) that point into a module are listed, nearest first, with x19-x22
+        // at the SVC wrapper, so the words above the gate's register frame (the guest stack at the SVC, regs + 800) that point into a module are listed, nearest first, with x19-x28
         uint64_t *sr = atomic_load(&t->svc_regs);
         if (sr && t->wkind) { uint64_t stk[160]; vm_size_t g4 = 0;
             if (!vm_read_overwrite(mach_task_self(), (vm_address_t)((uint8_t *)sr + 800), sizeof stk, (vm_address_t)stk, &g4) && g4 == sizeof stk) {
-                char sl[900]; int q = snprintf(sl, sizeof sl, "[dm]   %#x guest stack:", t->handle), nfr = 0;
+                char sl[1100]; int q = snprintf(sl, sizeof sl, "[dm]   %#x guest stack:", t->handle), nfr = 0;
                 for (int i = 0; i < 160 && nfr < 16 && q < (int)sizeof sl - 40; i++) { module_t *m2 = module_of((void *)stk[i]);
                     if (m2 && stk[i] - (uint64_t)m2->base < m2->text_end) { q += snprintf(sl + q, sizeof sl - q, " [%d]%s+%#llx", i * 8, m2->name, stk[i] - (uint64_t)m2->base); nfr++; } }
-                q += snprintf(sl + q, sizeof sl - q, " | x19=%#llx x20=%#llx x21=%#llx x22=%#llx", sr[19], sr[20], sr[21], sr[22]);
+                q += snprintf(sl + q, sizeof sl - q, " | x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx x24=%#llx x25=%#llx x26=%#llx x27=%#llx x28=%#llx", sr[19], sr[20], sr[21], sr[22], sr[23], sr[24], sr[25], sr[26], sr[27], sr[28]);
                 fprintf(stderr, "%s\n", sl); } }
         thr_bt(t);
     }
