@@ -29,6 +29,10 @@ zip_store	.bin:.tfc:.upk:.usm:.wad:.xxx:.metallib
 # with tex_flush_upload alone the LUT stays empty
 tex_flush_upload	on
 tex_dirty_upload	on
+# Presentation and pipelines as Breath of the Wild ships them (dm/games/README.md): present snapshots (a ring of 2 host textures) and render pipelines through MTL4Compiler on iOS with
+# the pipeline archive and the prepare step
+present_snap	on
+pso_mtl4	on
 
 # ---- Input ----
 # a 3D game: D-pad, right stick (camera) and L3 / R3 on the iPhone's virtual gamepad
