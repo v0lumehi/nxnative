@@ -13,6 +13,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** probes confirmed the legacy result: the framework presents at interval 1, VFR reports interval 1 with ratio 0.5, and when a frame runs long the game steps back to 2 with ratio 1, so the game speed does not change.
 - **Note:** the zeldaret/botw decompilation (`VFR.cpp`) gave the semantics; 1.9.0's addresses were found by the constants (`60 / interval`, the `fmov s11, #2.0` floor).
 
+### A thermally serious iPhone holds 30 fps
+
+- **Symptom:** on an iPhone, a game with the frame step at 60 fps drops a frame in most windows after a few minutes, and its GPU time per frame roughly doubles to triples (17-26 ms for the same scenes).
+- **Cause:** at thermal state serious (`NSProcessInfo` `thermalState` 2) iOS caps the GPU clock to about a third: the median of the frame's tiny passes, a clock proxy from `DM_NVN_GPUPROF`, rose from about 6 to 22 µs. A frame with thousands of draws no longer fits 16.7 ms, and running the GPU flat out keeps the device hot.
+- **Fix:** `thermal_capped` in `hle_nvn.c`: while the device is serious or worse, `fps_step_cap` holds 30 fps; it goes back to the cap after the device has been fair or better for 30 s (`THERMAL_CALM_NS`), so it does not flap. The thermal state is read once a second (`dm_thermal_now`). The log says `thermal state 2: the frame step holds 30 fps …` and `frame step cap 60 → 30 fps … (thermal state serious)`. `DM_THERMAL_CAP=0` turns it off. The Mac reports no thermal state, so it never applies there.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (iPhone 17 Pro Max, docked at 60 fps: serious after 226 s from a cold start, after 64 s from a warm one; at 30 fps the frames held with no drops).
+
 ### GPU timestamps per submission segment
 
 - **Symptom:** slow motion when the GPU is the bottleneck: a game's interval controller that times the GPU never steps up (GitHub issue #9).
