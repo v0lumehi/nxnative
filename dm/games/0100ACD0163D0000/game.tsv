@@ -23,6 +23,13 @@ modules	main sdk
 romfs_marker	BmGame/Movies/Ending.usm
 zip_store	.bin:.tfc:.upk:.usm:.wad:.xxx:.metallib
 
+# ---- Graphics ----
+# Unreal Engine 3 fills its textures in memory pools with the CPU and flushes most of them never: without both keys they stayed empty on the host
+# (the colour-grading LUT read back as zeros, so the tone-mapped scene was black, and Scaleform's bitmaps were missing). tex_dirty_upload is the one that matters:
+# with tex_flush_upload alone the LUT stays empty
+tex_flush_upload	on
+tex_dirty_upload	on
+
 # ---- Input ----
 # a 3D game: D-pad, right stick (camera) and L3 / R3 on the iPhone's virtual gamepad
 pad_layout	full

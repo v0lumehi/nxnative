@@ -2,7 +2,7 @@
 
 Update 1.0.5 (v327680) over the base game (the base NSP is 7 MB; the update holds the whole game, 26.9 GB), SDK 14.3.0 (its own `sdk` build). Part of Batman: Arkham Trilogy. Rocksteady's Unreal Engine 3: loose cooked packages (`BmGame/CookedSwitch/*.xxx`, Oodle-compressed chunks), texture caches (`*.tfc`), NVN, Wwise sound, CRI USM movies and Scaleform GFx menus. Modules `main` and `sdk`. GitHub issue #115.
 
-Status: **in bring-up, not playable.** On the Mac the game boots, plays its logo movies (WB Games and the others, at 30 fps), shows its first menus (the language prompt, the legal text with "Continue") and the title screen, whose 3D scene renders into the G-buffer; but the picture is wrong: the first menu and the title come out white or grey behind the UI, and after A on the title the whole screen stays white ([Open](#open)). About 2.4 GB resident with 1.4 GB of Metal allocations and an Unreal heap of 1.75 GB at the title. Not tried on an iPhone.
+Status: **in bring-up, not playable.** On the Mac the game boots, plays its logo movies (WB Games and the others, at 30 fps), shows its first menus (the language prompt, the legal text with "Continue") and the title screen with Batman in the rain behind the logo; but the picture is wrong: the first menu is white behind its UI, the title is washed out under light grey Scaleform panels, and after A on the title the whole screen stays white ([Open](#open)). About 2.4 GB resident with 1.4 GB of Metal allocations and an Unreal heap of 1.75 GB at the title. Not tried on an iPhone.
 
 ## What it needs
 
@@ -12,6 +12,7 @@ Status: **in bring-up, not playable.** On the Mac the game boots, plays its logo
 | `shader_key_skip 0x7d0+0x18` | [`game.tsv`](game.tsv) | the game shares control sections among shaders that differ only in GLSLC's hash: [Control sections shared among shaders that differ only in their hash](../../../docs/reference/shaders.md#control-sections-shared-among-shaders-that-differ-only-in-their-hash) |
 | `shader_groups GlobalShaderCache=global CombinedShaderCache=material` | `game.tsv` | the two Unreal Engine 3 shader caches: [Unreal Engine 3 shader caches](../../../docs/reference/shaders.md#unreal-engine-3-shader-caches-oodle-compressed-packages) |
 | Engage's 5 GB block: `mem_reserve 0x140000000`, `mem_alias 0x118000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000`, `sys_resource 0x2000000` | `game.tsv` | the provisional profile's guess (virtual address memory, no heap); with the host allocator the alias region holds only the engine's own maps |
+| `tex_flush_upload on`, `tex_dirty_upload on` | `game.tsv` | the game fills its textures with the CPU and flushes most of them never; without the keys the colour-grading LUT and other streamed textures stayed empty and the tone-mapped scene black: [CPU writes with no flush, caught by page protection](../../../docs/reference/nvn-objects.md#cpu-writes-with-no-flush-caught-by-page-protection-tex_dirty_upload) |
 | `pad_layout full` | `game.tsv` | a 3D game |
 
 ## Memory
@@ -29,7 +30,7 @@ Status: **in bring-up, not playable.** On the Mac the game boots, plays its logo
 ## Rendering
 
 - The title screen renders a 3D scene (the deferred G-buffer at 1440×812: scene colour RG11B10F, normals RGB10A2, two RGBA8 targets), tiled lighting and post-processing in compute shaders (subgroup votes, ballots and shuffles, threadgroup atomics), a tone-mapping compute pass (1×1 R16F eye adaptation, a 16³ colour-grading LUT in a 256×16 RGBA8 target), a copy to the 1920×1080 target (`f93e9daa6c80f2c2`, with gamma and fade constants) and Scaleform's UI (`648ee7c01ac61562` + `45c7c510cd31e73a`).
-- The G-buffer normals come out right (a texture dump of the title shows Batman's suit); the scene colour stays dark (mean 0.001, max 0.01).
+- **Resolved: the tone-mapped scene was black.** Its colour-grading LUT (a 256×16 RGBA8 texture), like the other textures the game fills with the CPU, stayed empty until `tex_flush_upload` and `tex_dirty_upload` (with the first alone it still read zeros). With both, the title shows Batman; the scene colour then reaches 2.6–3.9 (RG11B10F), the 1×1 R16F eye adaptation reads 0.77 and the tone-mapped image is dark (mean 0.02).
 
 ## Mac routes
 
@@ -46,11 +47,10 @@ General changes first needed here; each applies to every game:
 
 ## Open
 
-- **White picture behind the menus and on the title (current).** Found so far:
-  - The language prompt (frame ~1400) draws a full-screen canvas quad (`e3a4f9e6b5d56436` + `fdb9c6049fe4ae94`) from a 4×4 white texture with vertex colour (1, 1, 1, 0) and blending off, then Scaleform's UI. Replacing Scaleform's pixel shader (`45c7c510cd31e73a`) with one that outputs each varying showed its colour transform's add term at (1, 1, 1) and its multiply term at 0 in that frame: the UI draws a white rectangle over the screen by its own constants.
-  - On the title after A (frame 2100), the copy of the tone-mapped scene into the 1920×1080 target writes black (its constants: scale 1, fade 0, gamma 1), and Scaleform's pass turns the target white. Its first draw (5 quads over the whole screen) has a colour transform of black with alpha 0.8 in the uniform update recorded before it, so a white result means a later draw's constants or a white fill; not settled.
-  - The tone-mapped scene and the colour-grading LUT read back as zeros (`DM_NVN_TEXRAW`), the 1×1 R16F eye adaptation as 1.0; the scene colour (RG11B10F) is very dark. Whether the LUT is really empty or the read-back does not show what the compute shaders wrote is not checked.
-  - Ruled out: Metal fast math (all 22,024 shaders rebuilt with `-fno-fast-math`: the same white), the deferred uniform updates (`DM_NVN_UB_DEFER=0`: the same). Eden (a yuzu-line emulator on MoltenVK, on the same Mac) shows the same white, so the cause may be common to both rather than this host's NVN layer: the game's own state (a stuck Scaleform fade or timeline, a setting it reads) or something both emulate on Apple GPUs.
+- **White and light grey layers over the menus and the title (current).** Found so far:
+  - The first menu (the prompt with "Ⓐ Select"; it shows on every boot) starts with a full-screen canvas quad (`e3a4f9e6b5d56436` + `fdb9c6049fe4ae94`) that samples a 4×4 white texture (Unreal's default white texture, created at boot) with vertex colour (1, 1, 1, 0) and blending off, so it paints the screen white; the menu's own text does not show on it. What it should show instead (a movie or scene texture that is not ready, or a different state) is not found.
+  - Scaleform's shapes (`97dbfa4e3b5f2e3b` + `45c7c510cd31e73a`, batched: the batch index in the second vertex attribute's z picks four uniform rows per shape) have white vertex colours and colour transforms of (1, 1, 1, α) and (0, 0, 0, 0), α 0.2 on the first menu and 0.7 / 0.4 / 0.3 on the title; the same values at frames 2050 and 2450, so they are not an animation caught midway. Drawn with straight alpha blending, they cover the title in light grey; whether the game means them so or reads a state the host answers differently is not settled. Replacing the pixel shader with one that outputs each varying confirmed that the shader reads what the uniforms hold.
+  - Ruled out: Metal fast math (all 22,024 shaders rebuilt with `-fno-fast-math`: the same white), the deferred uniform updates (`DM_NVN_UB_DEFER=0`: the same), stencil masks (every one of these draws has the stencil test off and all colour channels on). Eden (a yuzu-line emulator on MoltenVK, on the same Mac) shows the same white, so the cause may be common to both rather than this host's NVN layer.
 - **An intermittent stall at the menus** (some runs, with or without sound and window): the main thread waits on an Unreal FEvent (an `nn::os` LightEvent, `main+0xbdd9f4`), the rendering thread in `TimedWaitLightEvent`, and presents stop around frame 1200–1800. With `DM_PROBE` on the wait the timing changes and it did not occur. Not found yet.
 - **A rare crash** at `main+0x2031740` (sig 11, a wild pointer, `lr=main+0xeadc0`), once in about 30 boots.
 - **A window that loses focus pauses the game** (`oe focus state → 2`, the game sets focus handling mode 1): Mac runs driven by `DM_CTL` should run without a window.
