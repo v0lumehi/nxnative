@@ -47,7 +47,8 @@ sys_resource	0x2000000
 # ---- Shader split ----
 # Unreal Engine 3's global shader cache (GlobalShaderCache-Switch.bin) and the material shader cache package (CombinedShaderCache-Switch.xxx; shader_split.py ue3_package / ue3_records)
 shader_groups	GlobalShaderCache=global CombinedShaderCache=material
-# The game keeps one control section for shaders whose control sections differ only in the 24-byte hash at +0x7d0, the first one loaded, so a program's control section is often another
-# shader's (31 of 80 shaders the opening used); keys leave those bytes out (hle_nvn.c keys_hash, shader_split.py key_ctl)
-shader_key_skip	0x7d0+0x18
+# The game keeps one control section for shaders whose control sections differ only from +0x770 on (GLSLC's compile information: the hash at +0x7d0, register counts at +0x790 and a
+# word at +0x778), the first one loaded, so a program's control section is often another shader's (31 of 80 shaders the opening used, more in game); keys leave +0x770..+0x7e8 out
+# (hle_nvn.c keys_hash, shader_split.py key_ctl). Nothing the translation reads lies there (the code size at +0x704, the compute group at +0x748)
+shader_key_skip	0x770+0x78
 shader_note	Batman: Arkham Knight shaders
