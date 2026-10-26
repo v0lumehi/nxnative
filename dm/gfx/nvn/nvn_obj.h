@@ -193,6 +193,7 @@ void mtl_set_tex_pool_n(int n);                            // Texture descriptor
 void mtl_set_frame(uint64_t f);
 void mtl_ub_present(double iv_ms);   // Same-process alternating measurement (DM_NVN_UB): the present thread reports the actual present interval every frame
 double mtl_gpu_ms(uint64_t f);
+void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms);   // DM_AB phases (nvn_mtl.m)
 void mtl_sub_index(const uint64_t *h, int n);   // Start of submission: build the store lookahead index in replay order (nvn_mtl.m)
 void xv_test_counts(int *dc, int *viol);
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1);   // The frame's earliest GPUStart / latest GPUEnd (mach absolute time, ns); returns 0 if not all complete or there is no GPU time
