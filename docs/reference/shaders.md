@@ -733,6 +733,13 @@ shader on a GPU.
 - **Found on:** [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md): from Castti's opening flashback and the battlefield of Hikari's opening on.
 - **Check:** found by bisecting with four runs started at once on copies of one save: `DM_NVN_PREDICT=0` fixed it, a look-ahead that compiled nothing did not, and of its parts only the state ops brought it back; four runs green before the fix, four right after it.
 
+### GPU frame captures need pipelines built through the device
+
+- **Symptom:** a GPU frame capture (`DM_GPU_CAPTURE`, or Xcode with `MTL_CAPTURE_ENABLED=1`) fails with `Capturing Render pipeline specialization is not supported`, or the capture layer crashes on the pipeline archive; a capture of the `MTLDevice` is refused.
+- **Cause:** Metal cannot capture pipelines made from Metal 4 bases (`DM_PSO_MTL4`, the default on the Mac), and its Metal 4 to 3 conversion for the capture layer crashed on the pipeline archive. A device the replay drives through Metal 4 cannot be the capture object.
+- **Fix:** a run that may capture (`DM_GPU_CAPTURE` or `MTL_CAPTURE_ENABLED` set) builds its render pipelines through the `MTLDevice`, without bases or archive (`pso4_on`), and `gpu_capture_frame` captures the Metal 4 queue (`g_q4`): work on the old queue (present, some uploads) is not in the trace. Such a run builds pipelines more slowly than a normal one, so its frame times are not the game's. Every game.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (Mac and iPhone).
+
 ### A cold Metal cache looks like a long load
 
 - **Symptom:** the first boot sat on the loading clock for about a minute, the CPU idle, with every file read done after 12 s.
