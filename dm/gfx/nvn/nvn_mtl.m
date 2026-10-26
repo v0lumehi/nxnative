@@ -2294,7 +2294,11 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
 }
 // CPU-written block-linear textures (WriteTexels): the game gave no packaged layout and changes the content from the CPU each frame (Engage's movie frames: a Y plane R8 + a UV plane RG8, WriteTexels every frame).
 // Only packaged textures used to be uploaded from guest memory, so such a texture became a GPU-only texture whose content stayed 0. Their serials are recorded and they resolve through the packaged path (upload + re-upload on dirty pages)
-static pthread_mutex_t g_cpu_tex_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableSetRef g_cpu_tex;
+// The serials of the textures the CPU writes (mtl_tex_cpu_written), asked at every texture resolve (tex_mtl_, tex_by_id). A CFSet with no callbacks hashed the serials as the
+// numbers they are, and serials come in order: they filled one run of neighbouring buckets, and every lookup of a texture not in the set (nearly all of them) probed to the run's
+// end. Batman: Arkham Knight's 6,400 CPU-written textures made those probes half the rendering thread's time (__CFBasicHashFindBucket_Linear; submission 10.6 → 2.2 ms of CPU a frame);
+// the host's own table mixes the key, and a released texture leaves it (mtl_tex_release)
+static pthread_mutex_t g_cpu_tex_mu = PTHREAD_MUTEX_INITIALIZER; static nvn_hmap g_cpu_tex = {.klen = 8};
 // The GPU owns the texture's content: its host texture was made to be rendered into or written by shaders (nvn_ft_poll in hle_nvn.c never re-uploads such a texture from guest memory)
 int mtl_tex_gpu_owned(uint64_t serial) {
     __unsafe_unretained id o = tex_get(serial);
@@ -2305,17 +2309,17 @@ void mtl_tex_cpu_written(const tex_t *t) {
     uint64_t serial = t->serial;
     if (!serial) return;
     pthread_mutex_lock(&g_cpu_tex_mu);
-    if (!g_cpu_tex) g_cpu_tex = CFSetCreateMutable(NULL, 0, NULL);
     int added = 0;
-    if (!CFSetContainsValue(g_cpu_tex, (const void *)(uintptr_t)serial)) {
-        CFSetAddValue(g_cpu_tex, (const void *)(uintptr_t)serial); added = 1;
+    if (!nvn_hm_get(&g_cpu_tex, &serial)) {
+        nvn_hm_put(&g_cpu_tex, &serial, (void *)1); added = 1;
         static int n; if (n++ < 16) MLOG("CPU-written texture ser=%llu %ux%ux%u format %#x target %d levels %u: uploaded / re-uploaded like a swizzled texture", (unsigned long long)serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels);
     }
     pthread_mutex_unlock(&g_cpu_tex_mu);
     if (added) { pthread_mutex_lock(&g_smu); g_ser_gen++; pthread_mutex_unlock(&g_smu); }   // the texture IDs that resolve to it take the slow path, which now treats it as packaged (tex_by_id view_pkg)
 }
+unsigned mtl_cpu_tex_count(void) { pthread_mutex_lock(&g_cpu_tex_mu); unsigned n = g_cpu_tex.n; pthread_mutex_unlock(&g_cpu_tex_mu); return n; }
 static int tex_cpu_written(uint64_t serial) {
-    pthread_mutex_lock(&g_cpu_tex_mu); int r = g_cpu_tex && CFSetContainsValue(g_cpu_tex, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_cpu_tex_mu);
+    pthread_mutex_lock(&g_cpu_tex_mu); int r = nvn_hm_get(&g_cpu_tex, &serial) != NULL; pthread_mutex_unlock(&g_cpu_tex_mu);
     return r;
 }
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
@@ -2544,6 +2548,7 @@ void mtl_vc_drop(uint64_t ser);
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
     pthread_mutex_lock(&g_smu); nvn_hm_del(&g_tex_live, &t->serial); free(nvn_hm_del(&g_image_desc, &t->serial)); pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_cpu_tex_mu); nvn_hm_del(&g_cpu_tex, &t->serial); pthread_mutex_unlock(&g_cpu_tex_mu);
     serial_del(t->serial);
     mtl_vc_drop(t->serial);
 }

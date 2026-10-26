@@ -190,6 +190,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Note:** with the encode thread (`DM_NVN_ENC_THREAD`) a segment's commit record is handed to it at once (`rec_publish` in `sub_cut`), not when its block of records fills. Breath of the Wild on an M2 Max (encode thread and snapshots, `DM_FPS_TARGET=120`): the frame's wait on its newest fence 12.5 ms with `DM_NVN_CUT=0`, 5.6 ms with 64, 5.35 ms with 16.
 - **Note:** MacNativeGames moved its cut to 30 draws for the first segment and 40 after (`2fa27d7`; uncapped Tears of the Kingdom in a shrine, 10.77 → 10.60 ms a frame). At this repository's 60 fps cap the size changes nothing where the GPU finishes inside the frame: Breath of the Wild outdoors on an M4 Pro (2026-10-26, the outdoor seed of the [BotW Mac routes](../../dm/games/01007EF00011E000/README.md#mac-routes), frames 3,001–5,700, cut 64) waited on its fence 0.02 ms a frame on average (`@sync_ms`), with GPU span 10.8 ms. The default stays 64; a GPU-bound device (an iPhone) is where a smaller cut could show, through `DM_NVN_CUT`.
 
+### The set of CPU-written textures hashed by serial
+
+- **Symptom:** the submit thread's CPU samples half in `__CFBasicHashFindBucket_Linear` under `CFSetContainsValue` (from `tex_mtl_` and `tex_by_id`), a few hundred thousand to over a million instructions of translation per draw, the submission growing with the game's CPU-written textures.
+- **Cause:** the set of textures the CPU writes (`tex_dirty_upload`, `mtl_tex_cpu_written`) was a CFSet with no callbacks, which hashes a serial as the number it is; serials come in order, so they filled one run of neighbouring buckets, and each lookup of a texture not in the set (nearly every one) probed to the end of the run. Released textures stayed in it.
+- **Fix:** the host's own table (`nvn_hmap`, which mixes the key), and `mtl_tex_release` removes the texture. The `packaged textures` log line counts the ones alive.
+- **Found on:** Batman: Arkham Knight (`0100ACD0163D0000`; its profile and note are in a PR of their own): 6,442 CPU-written textures alive in the opening; the submission went from 10.6 to 2.2 ms of CPU a frame (1.46 M → 0.15 M instructions per draw), the frame from 12 ms (render thread bound) to 8.4 ms at a 120 fps target.
+- **Check:** `t_cpu_tex`: 6,442 consecutive serials recorded once each, a released texture leaving the set, and a million lookups of serials not in it (14.8 ms on an M2 Max).
+
 ### Address to memory pool lookups by binary search
 
 - **Symptom:** the submit thread's CPU samples dominated by `mtl_addr` / `mtl_gpu_addr` (vertex buffers in `draw`, uniform buffers in `encode_args`).

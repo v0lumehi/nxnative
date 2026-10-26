@@ -88,6 +88,12 @@ t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
 check_t_link_ticks: t_link_ticks
 	./t_link_ticks
 run: check_t_link_ticks
+t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_cpu_tex
+check_t_cpu_tex: t_cpu_tex
+	./t_cpu_tex
+run: check_t_cpu_tex
 t_cube_placeholder: t_cube_placeholder.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cube_placeholder.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_cube_placeholder
