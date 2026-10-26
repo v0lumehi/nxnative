@@ -90,7 +90,7 @@ def by_build(main_id):   # the profile whose build rows register this main build
 
 def shader_key_skip(g):
     """(offset, length) of the control-section bytes a shader key leaves out (zeroed before hashing: hle_nvn.c keys_hash, shader_split.py skey), (0, 0) for none. Profile key shader_key_skip
-    <offset>+<length>: Batman: Arkham Knight shares one control section among shaders that differ only in the 24-byte hash at +0x7d0, so a program's control section is another shader's"""
+    <offset>+<length>: Batman: Arkham Knight shares one control section among shaders that differ only in GLSLC's compile information from +0x770 on, so a program's control section is another shader's"""
     v = g.get('shader_key_skip', '')
     if not v: return 0, 0
     m = re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)\+(0x[0-9a-fA-F]+|\d+)', v)

@@ -9,7 +9,7 @@ Status: **in bring-up, not playable yet.** On the Mac the game boots, plays its 
 | Setting | Where | Why |
 |---|---|---|
 | FMallocBinned3 construction cut (`main+0x192ec14`: `b main+0x192fea4`) | [`patches.py`](patches.py), `dm/host/hle_uemalloc.c` (layout `UE3`) | its allocator reserves 1 GB + 37 GB of address regions, which failed (0x1803); the host allocator runs in its place: [Unreal's FMallocBinned3 replaced by the host allocator](../../../docs/reference/memory.md#unreals-fmallocbinned3-replaced-by-the-host-allocator) |
-| `shader_key_skip 0x7d0+0x18` | [`game.tsv`](game.tsv) | the game shares control sections among shaders that differ only in GLSLC's hash: [Control sections shared among shaders that differ only in their hash](../../../docs/reference/shaders.md#control-sections-shared-among-shaders-that-differ-only-in-their-hash) |
+| `shader_key_skip 0x770+0x78` | [`game.tsv`](game.tsv) | the game shares control sections among shaders that differ only in GLSLC's compile information: [Control sections shared among shaders that differ only in their compile information](../../../docs/reference/shaders.md#control-sections-shared-among-shaders-that-differ-only-in-their-compile-information) |
 | `shader_groups GlobalShaderCache=global CombinedShaderCache=material` | `game.tsv` | the two Unreal Engine 3 shader caches: [Unreal Engine 3 shader caches](../../../docs/reference/shaders.md#unreal-engine-3-shader-caches-oodle-compressed-packages) |
 | Engage's 5 GB block: `mem_reserve 0x140000000`, `mem_alias 0x118000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000`, `sys_resource 0x2000000` | `game.tsv` | the provisional profile's guess (virtual address memory, no heap); with the host allocator the alias region holds only the engine's own maps |
 | `tex_flush_upload on`, `tex_dirty_upload on` | `game.tsv` | the game fills its textures with the CPU and flushes most of them never; without the keys the colour-grading LUT and other streamed textures stayed empty and the tone-mapped scene black: [CPU writes with no flush, caught by page protection](../../../docs/reference/nvn-objects.md#cpu-writes-with-no-flush-caught-by-page-protection-tex_dirty_upload) |
@@ -24,7 +24,7 @@ Status: **in bring-up, not playable yet.** On the Mac the game boots, plays its 
 ## Files and shaders
 
 - 4,093 cooked packages (`.xxx`, 19 GB): an uncompressed summary in Rocksteady's own serialization, then compressed chunks (tag `0x9E2A83C1`, 128 KB blocks, Oodle Mermaid). The game's `OodleLZ_Decompress` is `main+0x8f8250`, found by its name string.
-- Shaders: `GlobalShaderCache-Switch.bin` (magic `BMSG`, stored whole) and `CombinedShaderCache-Switch.xxx` (29 MB, 136 MB decoded); no other package holds any. 24,721 records, 22,024 keys with `shader_key_skip` (2,629 vertex, 19,269 pixel, 124 compute, 2 geometry), all built for the Mac (28 minutes with 4 workers). A boot through the menus to the title reports no shader missing from the map.
+- Shaders: `GlobalShaderCache-Switch.bin` (magic `BMSG`, stored whole) and `CombinedShaderCache-Switch.xxx` (29 MB, 136 MB decoded); no other package holds any. 24,721 records, 21,923 keys with `shader_key_skip` (2,564 vertex, 19,233 pixel, 124 compute, 2 geometry), all built for the Mac (28 minutes with 4 workers). With `0x7d0+0x18` the opening cutscenes still met shaders whose control sections differed from +0x778 on; with `0x770+0x78` all 40 dumped are in the map.
 - Movies: CRI USM (`BmGame/Movies`, 7.5 GB), decoded by the game's own CRI threads (`CRI MPV Worker`); the logo movies play.
 
 ## Rendering
@@ -42,7 +42,7 @@ General changes first needed here; each applies to every game:
 
 - **The NSP script converts NSZ files with a standalone `nsz` executable on PATH** when the Python running it has no `nsz` module ([docs/development.md](../../../docs/development.md)).
 - **Unreal Engine 3 shader caches in the shader split** (`shader_split.py` `ue3_package`, `ue3_records`; `profile_guess.py` `ue3`): [Unreal Engine 3 shader caches (Oodle-compressed packages)](../../../docs/reference/shaders.md#unreal-engine-3-shader-caches-oodle-compressed-packages).
-- **Profile key `shader_key_skip`** (`hle_nvn.c` `keys_hash`, `shader_split.py` `key_ctl`): [Control sections shared among shaders that differ only in their hash](../../../docs/reference/shaders.md#control-sections-shared-among-shaders-that-differ-only-in-their-hash).
+- **Profile key `shader_key_skip`** (`hle_nvn.c` `keys_hash`, `shader_split.py` `key_ctl`): [Control sections shared among shaders that differ only in their compile information](../../../docs/reference/shaders.md#control-sections-shared-among-shaders-that-differ-only-in-their-compile-information).
 - **Unreal Engine 3's FMalloc on the host allocator** (layout `UE3`, a cut that is a branch): [Unreal's FMallocBinned3 replaced by the host allocator](../../../docs/reference/memory.md#unreals-fmallocbinned3-replaced-by-the-host-allocator).
 - **Vertex streams at addresses that are not 4-byte aligned copied** (`vbuf_unaligned`, `t_vbuf`): [Vertex streams at addresses that are not 4-byte aligned](../../../docs/reference/rendering.md#vertex-streams-at-addresses-that-are-not-4-byte-aligned).
 
