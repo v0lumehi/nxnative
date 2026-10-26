@@ -1,4 +1,5 @@
-// Real Metal readback: cached stream bindings survive helper overwrites, encoder/submit changes and pool replacement.
+// Real Metal readback: cached stream bindings survive helper overwrites, encoder/submit changes and pool replacement; a stream at an address that is not 4-byte aligned
+// is copied (Metal reads vertex buffers from 4-byte-aligned addresses only; Batman: Arkham Knight's Scaleform streams sit at addresses 2 mod 4).
 #include "../nvn/nvn_mtl.m"
 uint64_t g_t0_ns;
 int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }   // Tests use host-thread stacks.
@@ -41,7 +42,8 @@ int main(void) { @autoreleasepool {
     if (posix_memalign((void **)&mem, size, size)) abort();
     memset(mem, 0, size); mem[0] = 11; mem[1] = 22; mem[2] = 33; mem[3] = 99;
     mtl_pool_add(mem, size);
-    id<MTLBuffer> out = [g_dev newBufferWithLength:16 * 8 options:MTLResourceStorageModeShared]; res_add(out);
+    uint8_t *ub = (uint8_t *)mem + 64; uint32_t want = 0x87654321u; memcpy(ub + 2, &want, 4); ub[0] = 0x11; ub[1] = 0x22; ub[6] = 0x33; ub[7] = 0x44;   // 4 bytes at an address 2 mod 4
+    id<MTLBuffer> out = [g_dev newBufferWithLength:16 * 9 options:MTLResourceStorageModeShared]; res_add(out);
     state_reset();
     // Exercise the compact record through the production dispatcher before the
     // existing shader reads each stream. Its public state remains a full range.
@@ -80,6 +82,14 @@ int main(void) { @autoreleasepool {
     bind_vbufs(en); EXPECT("pool replacement resolves all streams", 3, g_vbuf_resolve - resolves);
     EXPECT("replacement address bound", newgpu, g_vt_addr[VB_SLOT(0)]);
     capture(en, out, 7); enc_r_end(en); finish();
+    // A stream at an address 2 mod 4: bound as it is, Metal would read the word at the aligned address below (0x43212211 here)
+    mtl_sub_begin(); en = encoder(ps); uint64_t copies, bytes, d0, d1, d2, d3; mtl_vbuf_stats(&d0, &d1, &d2, &d3, &copies, &bytes);
+    S.vbuf[0].address = (uint64_t)(ub + 2); S.vbuf[0].size = 6; bind_vbufs(en); bind_vbufs(en); capture(en, out, 8); enc_r_end(en); finish();
+    uint64_t copies2, bytes2; mtl_vbuf_stats(&d0, &d1, &d2, &d3, &copies2, &bytes2);
+    EXPECT("unaligned stream copied once per submission", 1, copies2 - copies);
+    EXPECT("unaligned stream copy size", 6, bytes2 - bytes);
+    EXPECT("unaligned stream readback", want, ((const uint32_t *)out.contents)[8 * 4]);
+    S.vbuf[0].address = (uint64_t)(mem + 3); S.vbuf[0].size = 4;
     const uint32_t *pixels = out.contents;
     for (int row = 0; row < 8; row++) {
         EXPECT("stream 0 readback", row == 2 || row >= 6 ? 99 : 11, pixels[row * 4]);

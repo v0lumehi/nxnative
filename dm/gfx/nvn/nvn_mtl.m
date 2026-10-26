@@ -94,7 +94,7 @@ static id<MTL4CommandBuffer> g_present_cb[3];
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
 static int g_vbuf_cache = 1;   // DM_NVN_VBUF_CACHE=0 restores the uncached path for A/B measurements
 static uint64_t g_vt_addr[31]; static uint32_t g_vt_valid;
-static uint64_t g_vbuf_resolve, g_vbuf_reuse, g_vbuf_set, g_vbuf_skip;
+static uint64_t g_vbuf_resolve, g_vbuf_reuse, g_vbuf_set, g_vbuf_skip, g_vbuf_copies, g_vbuf_copy_bytes;   // copies: vertex streams at addresses not 4-byte aligned (vbuf_unaligned)
 static id<MTL4ArgumentTable> g_present_args;
 static id<MTLBuffer> g_present_uv[3];
 static uint64_t g_present_alloc_fence[3];
@@ -1364,7 +1364,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[113];
+static int g_red_once[115];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -3832,6 +3832,25 @@ static void ubd_dirty(uint64_t lo, uint64_t hi) {
     for (int st = 0; st < 6; st++) { if (g_args_dirty[st]) continue;
         for (int r = 0; r < 16; r++) { const p_bind_buf *u = &S.ubo[st][r]; if (u->addr && lo < u->addr + u->size && u->addr < hi) { g_args_dirty[st] = 1; break; } } }
 }
+// A vertex stream whose guest address is not 4-byte aligned: Metal reads a vertex buffer only from a 4-byte-aligned address (the low bits are dropped), and NVN takes any address.
+// Batman: Arkham Knight's Scaleform draws its shapes from streams at addresses 2 mod 4 (16-byte vertices: two RGBA8 attributes, an RG32F position): read 2 bytes early, every
+// position was garbage and the shapes, white by their colour transforms, covered the menus and the title. The stream's range is copied into the submission's arena; streams at the
+// same address and size share one copy in a submission. Returns the copy's GPU address, 0 when the range is in no pool or too large
+#define VBUF_COPY_MAX (64u << 20)
+static uint64_t vbuf_unaligned(uint64_t addr, uint64_t size) {
+    static struct { uint64_t addr, size, sub, gpu; } copies[16]; static int next;
+    for (int i = 0; i < 16; i++) if (copies[i].sub == g_sub_serial && copies[i].addr == addr && copies[i].size == size) return copies[i].gpu;
+    void *mb; uint64_t mo; const uint8_t *src;
+    if (!size || size > VBUF_COPY_MAX || !mtl_addr(addr, size, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) {
+        RED_ONCE(113, "vertex stream at an address not 4-byte aligned (%#llx, %llu bytes) could not be copied: bound as it is, which Metal reads from the aligned address below", (unsigned long long)addr, (unsigned long long)size);
+        return 0;
+    }
+    if (pend_hits(addr, size)) RED_ONCE(114, "vertex stream at an address not 4-byte aligned has GPU-side writes in this submission: copied from the current content");
+    id<MTLBuffer> ab; size_t off = arena_alloc((size_t)size, &ab); memcpy((uint8_t *)ab.contents + off, src + mo, (size_t)size);
+    g_vbuf_copies++; g_vbuf_copy_bytes += size;
+    int c = next++ % 16; copies[c].addr = addr; copies[c].size = size; copies[c].sub = g_sub_serial; copies[c].gpu = ab.gpuAddress + off;
+    return copies[c].gpu;
+}
 // Resolved guest streams are separate from the table cache: vconv_bind may overwrite a stream's table slot.
 // Take the pool generation before resolving, so a concurrent pool change forces a fresh lookup next time.
 static void bind_vbufs(id<MTL4RenderCommandEncoder> en) {
@@ -3840,6 +3859,7 @@ static void bind_vbufs(id<MTL4RenderCommandEncoder> en) {
     for (int s = 0; s < 16; s++) {
         uint64_t addr = S.vbuf[s].address, gpu;
         if (!addr) continue;
+        if (addr & 3) { uint64_t c = vbuf_unaligned(addr, S.vbuf[s].size); if (c) { cache[s].addr = 0; enc_r_vbuf(en, VB_SLOT(s), c); continue; } }   // not cached: the copy is per submission
         if (g_vbuf_cache && cache[s].addr == addr && cache[s].gen == gen) { gpu = cache[s].gpu; g_vbuf_reuse++; }
         else {
             void *mb; uint64_t mo; g_vbuf_resolve++;
@@ -9925,8 +9945,8 @@ void mtl_present_wait(uint64_t tk) {
 void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pq_mu); mtl_present_wait(h); }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = g_stat_args_enc; *reuse = g_stat_args_reuse; }
-void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip) {
-    *resolve = g_vbuf_resolve; *reuse = g_vbuf_reuse; *set = g_vbuf_set; *skip = g_vbuf_skip;
+void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) {
+    *resolve = g_vbuf_resolve; *reuse = g_vbuf_reuse; *set = g_vbuf_set; *skip = g_vbuf_skip; *copies = g_vbuf_copies; *copy_bytes = g_vbuf_copy_bytes;
 }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = 0; *skip = 0; }
 uint64_t mtl_ds_omit(void) { return g_stat_ds_omit; }

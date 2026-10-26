@@ -390,6 +390,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** translated shaders use only `buffer(0)`, so streams 14 and 15 now go to slots 14 and 15 (`VB_SLOT`).
 - **Found on:** [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (a minute and a half into the prologue).
 
+### Vertex streams at addresses that are not 4-byte aligned
+
+- **Symptom:** Scaleform fills come out as solid white or light grey sheets over the whole screen, hard-edged triangles and bands, and the menu text is missing (a language list or a title screen that is all white behind its button prompt).
+- **Cause:** Metal reads a vertex buffer only from a 4-byte-aligned address: bound at an address 2 mod 4, every vertex was read 2 bytes early. NVN takes any address, and Scaleform's vertex streams (16-byte vertices: two RGBA8 attributes and an RG32F position) sit at addresses such as `…6d6a`. The positions became garbage spanning the screen, and the shapes, white with alpha 0.2–0.7 by their colour transforms, overlapped many times.
+- **Fix:** `bind_vbufs` copies a stream whose address is not 4-byte aligned into the submission's arena (`vbuf_unaligned`; one copy per address and size in a submission, up to 64 MB) and binds the copy. The log's `vertex bindings` line counts the copies; `t_vbuf` checks the readback. The index buffers at addresses 2 mod 4 (16-bit indices) needed nothing.
+- **Found on:** [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md) (Scaleform GFx; 2–13 copies of 3–18 MB a frame in the menus and at the title, which the draws' vertex ranges could narrow). With the copy the language menu and the title screen draw right.
+
 ### Programs bound per stage
 
 - **Symptom:** scenes and characters black, only foliage, light shafts and the HUD drawn; pass dumps full of `Z … draw skipped: no program bound`.
