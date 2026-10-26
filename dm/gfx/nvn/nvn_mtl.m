@@ -9965,12 +9965,19 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     if (!mtl_link_active()) return 0;
     // Wait for the display link only when running faster than the display: if a display-link tick has already passed since the previous frame started work (this frame is already behind), start immediately instead of waiting in vain for the next display-link tick --
     // otherwise when the frame time is slightly more than one display-link period it would "miss the tick -> wait another whole tick", locking the frame rate straight to half (measured on Mac under windowed load: runs of dropped frames)
-    static uint64_t started_tick;   // Display-link tick number when the previous frame started work (only the game's present thread calls this function)
     // How many display-link ticks one frame takes: the game's present interval (vsyncs, 60 Hz) times 1 with a 60 Hz display link, times 2 with a 120 Hz one, halved and rounded up at 30 Hz.
     // A frame presented with interval N blocks the game for N vsyncs on the Switch, as the display callback holds it N ticks: games that scale their time step by the interval (BotW's VFR: interval / 2)
     // ran at double speed while they produced interval-2 frames every 60 Hz tick (iPhone log: Link sprinting with B, the interval flapping 1 ↔ 2)
     if (vsyncs < 1) vsyncs = 1;
-    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 ? 2 : 1);
+    return mtl_link_wait_ticks(g_link_mode == 3 ? (vsyncs + 1) / 2 : vsyncs * (g_link_mode == 2 ? 2 : 1), timeout_ns);
+}
+// The display link's rate: 120 Hz (DM_PRESENT_LINK=2), 60, or 30 in power-saving mode
+int mtl_link_rate(void) { return g_link_mode == 3 ? 30 : g_link_mode == 2 ? 120 : 60; }
+// The same wait counted in the display link's own ticks: one per frame for a frame rate as high as the link's (present_interval display at DM_PRESENT_HZ=120 on a 120 Hz link)
+int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) {
+    if (!mtl_link_active()) return 0;
+    static uint64_t started_tick;   // Display-link tick number when the previous frame started work (only the game's present thread calls this function)
+    const uint64_t step = ticks < 1 ? 1 : (uint64_t)ticks;
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
