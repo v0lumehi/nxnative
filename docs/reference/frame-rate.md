@@ -102,6 +102,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `DM_TEST_PRESENT_LAG=90,30` (sleep 30 ms before every 90th present) makes Mario do this on the Mac; run it with `DM_WINDOW=1` to get the display link. `DM_NVN_TSV` writes each frame's interval as `@itv`.
 - **Note:** the windowless Mac host was never affected by the acquire: there the acquire sleeps until the interval's slot.
 
+### One frame per tick of a 120 Hz display link
+
+- **Symptom:** with `present_interval display`, `DM_PRESENT_HZ=120` and `DM_PRESENT_LINK=2` (a 120 Hz display link) a game stays at 60 fps although its frame takes 8 ms; the display link logs about two ticks per present.
+- **Cause:** the acquire waits for the present interval's vsyncs on the display link (`mtl_link_wait_tick`), counted in 60 Hz vsyncs, so two ticks of a 120 Hz link per frame; display mode's interval is 1.
+- **Fix:** in display mode above 60 Hz the acquire waits as many link ticks as one tick of the present rate takes (`link_wait` in `hle_nvn.c`, `mtl_link_wait_ticks`): one at 120 Hz.
+- **Found on:** [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md): 119.8 fps in the opening cutscene on an M2 Max.
+
 ### Present snapshots: the game's swapchain texture free at once
 
 - **Symptom:** frames miss the screen while the GPU stays at its lowest clock (444 MHz on an M2 Max); more work (a higher render scale) only makes the frames slower.
