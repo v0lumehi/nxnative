@@ -208,6 +208,7 @@ int mtl_fps_target(void);                                   // target frame rate
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // vsyncs = the game's present interval
+unsigned mtl_cpu_tex_count(void);   // textures the CPU writes that are alive (mtl_tex_cpu_written)
 double mtl_presented_time(uint64_t n);
 int mtl_link_stalled(void);   // the display link is silent (background, occluded window, a stall) and queued frames are dropped instead of shown
 int mtl_snap_on(void); uint64_t mtl_snap_acquire_wait(void);   // present snapshots (DM_PRESENT_SNAP): on, and acquire's wait for ring capacity (returns ns spent pacing)

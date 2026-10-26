@@ -139,6 +139,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): a stack sample in the shrine had the main thread in `nvnSyncWait` (the fence of the frame just submitted) for 59% of the time and the render thread in `nvnQueueSubmitCommands` for 40%; the translation was about 3,600 draws and 347 passes, 7 ms, so per frame the GPU ran 13–14 ms and then sat idle 7.7 ms (`DM_NVN_TSV` rows `@gpu_beg_ms` / `@gpu_end_ms` against `@call_ms`). GPU idle per frame went from 7.7 to 3.8 ms; most of the rest is the game's own work between its fence wait and the next submit (about 2.5 ms). The other five games' frame times were unchanged; Metroid Dread's p95 dropped from 19.6 to 16.9 ms.
 - **Note:** after this, BotW's docked frame p50 was 16.7 ms (was 20.8 ms before segmenting). Host translation is 8 ms per frame (22,000 instructions per draw), spread over Metal's encoder creation and draw calls, argument encoding, Objective-C retain / release and pool lookups. The per-pass GPU timer (`DM_NVN_PASSGPU`) is switched off under Metal 4 (`pg_render` returns at once), so GPU time cannot yet be attributed to passes. Render-target traffic per frame is in `DM_NVN_TSV`'s `@rt_load_mb` / `@rt_store_mb`.
 
+### The set of CPU-written textures hashed by serial
+
+- **Symptom:** the submit thread's CPU samples half in `__CFBasicHashFindBucket_Linear` under `CFSetContainsValue` (from `tex_mtl_` and `tex_by_id`), a few hundred thousand to over a million instructions of translation per draw, the submission growing with the game's CPU-written textures.
+- **Cause:** the set of textures the CPU writes (`tex_dirty_upload`, `mtl_tex_cpu_written`) was a CFSet with no callbacks, which hashes a serial as the number it is; serials come in order, so they filled one run of neighbouring buckets, and each lookup of a texture not in the set (nearly every one) probed to the end of the run. Released textures stayed in it.
+- **Fix:** the host's own table (`nvn_hmap`, which mixes the key), and `mtl_tex_release` removes the texture. The `packaged textures` log line counts the ones alive.
+- **Found on:** [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md): 6,442 CPU-written textures alive in the opening; the submission went from 10.6 to 2.2 ms of CPU a frame (1.46 M → 0.15 M instructions per draw), the frame from 12 ms (render thread bound) to 8.4 ms at a 120 fps target.
+
 ### Address to memory pool lookups by binary search
 
 - **Symptom:** the submit thread's CPU samples dominated by `mtl_addr` / `mtl_gpu_addr` (vertex buffers in `draw`, uniform buffers in `encode_args`).
