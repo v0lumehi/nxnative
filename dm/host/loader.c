@@ -239,6 +239,22 @@ static void install_fps_state(module_t *m) {
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs. The fields beyond +0x40 are written only for a build whose rewriter table names their stubs
+// What a factor adds to the application pool and the alias region (the pool's growth plus 64 MB, in 2 MB steps), 0 at 1.0
+static uint64_t render_pool_extra(uint64_t pool, float sc) {
+    float sq = sc * sc; uint32_t k = (uint32_t)sq + (sq > (float)(uint32_t)sq);
+    return k < 2 ? 0 : ((uint64_t)(k - 1) * pool + (64ull << 20) + 0x1fffff) & ~0x1fffffull;
+}
+// The highest factor whose reservation (hle_svc.c RESERVE = the profile's mem_reserve + 2 x the extra) fits one block on this platform
+static float render_pool_max(uint64_t pool) {
+#if TARGET_OS_OSX
+    (void)pool; return 3.0f;
+#else
+    const uint64_t limit = 6ull << 30;   // iOS without com.apple.developer.kernel.extended-virtual-addressing (hle_svc.c: 6 GB succeeds, 7 GB fails)
+    for (float sc = 3.0f; sc > 1.0f; sc -= 0.05f)
+        if ((uint64_t)DM_GAME_MEM_RESERVE + 2 * render_pool_extra(pool, sc) <= limit) return sc;
+    return 1.0f;
+#endif
+}
 void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const module_t *m = g_fps_m; const char *name = m->name;
@@ -250,16 +266,13 @@ void dm_fps_state_apply(void) {
     dm_fps_var_cap = t > 60 ? t : 0;
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
     // another factor fixes the size at that multiple (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written at target 0 too. Above 1.0 (up to 3.0) only on a build whose
-    // stubs grow its render buffer pool (RENDER_POOL), and only on the Mac: the pool's growth comes on top of the guest's address space, which iOS caps at a 6 GB reservation (hle_svc.c)
-#if TARGET_OS_OSX
-    const float hi = m->render_pool ? 3.0f : 1.0f;
-#else
-    const float hi = 1.0f;
-#endif
+    // stubs grow its render buffer pool (RENDER_POOL), as far as the platform can reserve: the pool's growth comes on top of the guest's address space, which iOS caps at a 6 GB
+    // reservation (hle_svc.c). Breath of the Wild reserves 4 GB, so every factor to 3.0 fits there too (5.92 GB at 3.0); a game reserving more gets less (render_pool_max)
+    const float hi = m->render_pool ? render_pool_max(m->render_pool) : 1.0f;
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
     if (rs) {
         char *end; sc = strtof(rs, &end);
-        if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f%s; keeping the game's size", rs, hi, hi > 1.0f ? "" : " (above 1.0 only on the Mac, for a build whose stubs grow its render buffer pool)"); sc = 1.0f; }
+        if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.2f%s; keeping the game's size", rs, hi, hi > 1.0f ? "" : " (above 1.0 only for a build whose stubs grow its render buffer pool)"); sc = 1.0f; }
         else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", name, sc);
     }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
@@ -267,7 +280,7 @@ void dm_fps_state_apply(void) {
         // The game's render buffer pool grows by the factor's square, rounded up (+0x4c); the application pool and the alias region (where its virtual range lives) grow by what the
         // pool adds plus 64 MB, and so do the game's fixed heaps around the pool (+0x58). Breath of the Wild's 115 MB held up to a factor of about 1.3
         float sq = sc * sc; uint32_t k = (uint32_t)sq + (sq > (float)(uint32_t)sq);
-        uint64_t x = ((k - 1) * m->render_pool + (64ull << 20) + 0x1fffff) & ~0x1fffffull;
+        uint64_t x = render_pool_extra(m->render_pool, sc);
         int dm_mem_started(void);
         if (dm_mem_started()) { LOG("[RED] %s: render scale %.2f needs %.0f MB more application memory, but guest memory is already laid out; render buffer pool kept", name, sc, x / 1048576.0); k = 0; x = 0; }
         else LOG("%s: render buffer pool ×%u, %.0f MB more application memory (DM_RENDER_SCALE %.2f)", name, k, x / 1048576.0, sc);
